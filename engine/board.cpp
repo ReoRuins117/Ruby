@@ -77,13 +77,32 @@ std::string moveToUci(Move m) {
 Board::Board() { setFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"); }
 
 void Board::put(int square, int piece) {
+    if (tracking) {
+        Accumulator& a = acc[size_t(accTop)];
+        a.addPiece[a.added] = uint8_t(piece);
+        a.addSquare[a.added++] = uint8_t(square);
+    }
     squares[square] = int8_t(piece);
     hash ^= zPiece[piece][square];
 }
 
 void Board::remove(int square) {
+    if (tracking) {
+        Accumulator& a = acc[size_t(accTop)];
+        a.removePiece[a.removed] = uint8_t(squares[square]);
+        a.removeSquare[a.removed++] = uint8_t(square);
+    }
     hash ^= zPiece[squares[square]][square];
     squares[square] = EMPTY;
+}
+
+// A new, not yet calculated accumulator for the position after a move (or a null move).
+void Board::pushAccumulator() {
+    accTop++;
+    if (size_t(accTop) >= acc.size()) acc.resize(acc.size() * 2);
+    Accumulator& a = acc[size_t(accTop)];
+    a.computed = false;
+    a.added = a.removed = 0;
 }
 
 bool Board::setFen(const std::string& text) {
@@ -95,6 +114,10 @@ bool Board::setFen(const std::string& text) {
 
     std::memset(squares, 0, sizeof(squares));
     history.clear();
+    if (acc.empty()) acc.resize(256);
+    accTop = 0;
+    acc[0].computed = false;                              // worked out from scratch when first needed
+    acc[0].added = acc[0].removed = 0;
     hash = 0;
     king[WHITE] = king[BLACK] = -1;
     int file = 0, rank = 7;
@@ -194,6 +217,8 @@ void Board::make(Move m) {
         captureSquare = to + (side == WHITE ? -8 : 8);
         u.captured = squares[captureSquare];
     }
+    pushAccumulator();
+    tracking = true;
     if (u.captured) {
         remove(captureSquare);
         halfmove = 0;
@@ -205,7 +230,9 @@ void Board::make(Move m) {
         king[side] = to;
         if (to - from == 2) { int rook = squares[to + 1]; remove(to + 1); put(to - 1, rook); }
         if (from - to == 2) { int rook = squares[to - 2]; remove(to - 2); put(to + 1, rook); }
-    } else if (type == PAWN && std::abs(to - from) == 16) {
+    }
+    tracking = false;
+    if (type == PAWN && std::abs(to - from) == 16) {
         ep = (from + to) / 2;
         hash ^= zEp[ep & 7];
     }
@@ -223,6 +250,7 @@ void Board::make(Move m) {
 void Board::unmake() {
     Undo u = history.back();
     history.pop_back();
+    accTop--;
     side ^= 1;
     if (side == BLACK) fullmove--;
 
@@ -258,6 +286,7 @@ void Board::makeNull() {
     u.ep = int8_t(ep);
     u.halfmove = int16_t(halfmove);
     history.push_back(u);
+    pushAccumulator();                                    // same pieces, so nothing to add or remove
     if (ep >= 0) hash ^= zEp[ep & 7];
     ep = -1;
     halfmove = 0;                                         // repetition checks stop at a null move
@@ -268,6 +297,7 @@ void Board::makeNull() {
 void Board::unmakeNull() {
     Undo u = history.back();
     history.pop_back();
+    accTop--;
     side ^= 1;
     ep = u.ep;
     halfmove = u.halfmove;

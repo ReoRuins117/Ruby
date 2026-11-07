@@ -31,4 +31,8 @@ void clearHash();
 // Prints UCI "info" lines as it goes when verbose is true.
 Result think(Board& board, const Limits& limits, bool verbose);
 
+// For the weaker levels: scores every legal move with a shallow search, then picks one at random,
+// favouring better moves. A higher temperature (in centipawns) makes worse moves more likely.
+Move pickWeak(Board& board, int depth, int temperature);
+
 }  // namespace search

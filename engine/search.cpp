@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -325,6 +327,38 @@ Result think(Board& board, const Limits& limits, bool verbose) {
     }
     result.nodes = nodes;
     return result;
+}
+
+Move pickWeak(Board& board, int depth, int temperature) {
+    static std::mt19937 rng(std::random_device{}());
+    pos = &board;
+    limit = Limits();
+    nodes = 0;
+    aborted = false;
+    stopRequested = false;
+    startTime = std::chrono::steady_clock::now();
+    std::memset(killers, 0, sizeof(killers));
+    std::memset(historyScore, 0, sizeof(historyScore));
+
+    MoveList legal;
+    board.legalMoves(legal);
+    if (legal.size == 0) return NO_MOVE;
+    int scores[256], best = -MATE;
+    for (int i = 0; i < legal.size; i++) {
+        board.make(legal.moves[i]);
+        scores[i] = std::clamp(-negamax(depth - 1, -MATE, MATE, 1, true), -3000, 3000);
+        board.unmake();
+        best = std::max(best, scores[i]);
+    }
+    // Each move's chance is exp(-(how much worse than the best) / temperature).
+    double weights[256], total = 0;
+    for (int i = 0; i < legal.size; i++) total += weights[i] = std::exp(double(scores[i] - best) / temperature);
+    double r = std::uniform_real_distribution<double>(0, total)(rng);
+    for (int i = 0; i < legal.size; i++) {
+        r -= weights[i];
+        if (r <= 0) return legal.moves[i];
+    }
+    return legal.moves[legal.size - 1];
 }
 
 }  // namespace search

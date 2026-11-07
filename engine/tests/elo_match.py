@@ -10,6 +10,10 @@ Stop with Ctrl+C at any time; the result so far is still printed.
 
   python elo_match.py --play                     # play Ruby yourself, in the terminal
   python elo_match.py --play --color white --think 10
+  python elo_match.py --play --squidinator       # play a weaker Ruby
+
+Ruby's strength levels, weakest first: --blunderbuss, --furious_chicken, --squidinator and
+--uncle-sam (full strength, the default). They work in --play mode and in matches.
 
 In --play mode Ruby uses its own opening book and the Lichess tablebase, and spends --think seconds
 per move. Your clock isn't timed.
@@ -59,7 +63,7 @@ def parse_tc(text):
 
 def start_engines(a):
     ruby = chess.engine.SimpleEngine.popen_uci(a.ruby)
-    ruby.configure({"OwnBook": False, "Tablebase": a.tablebase, "Hash": a.hash})
+    ruby.configure({"OwnBook": False, "Tablebase": a.tablebase, "Hash": a.hash, "Level": a.level})
     stockfish = chess.engine.SimpleEngine.popen_uci(a.stockfish)
     limit = {} if a.full else {"UCI_LimitStrength": True, "UCI_Elo": a.elo}
     stockfish.configure({**limit, "Threads": a.sf_threads, "Hash": a.sf_hash or a.hash})
@@ -106,8 +110,8 @@ def play_game(a, ruby, stockfish, opening, ruby_white):
         board.push(move)
 
     game = chess.pgn.Game.from_board(board)
-    game.headers["White"] = "Ruby" if ruby_white else f"Stockfish {a.label}"
-    game.headers["Black"] = f"Stockfish {a.label}" if ruby_white else "Ruby"
+    game.headers["White"] = a.ruby_name if ruby_white else f"Stockfish {a.label}"
+    game.headers["Black"] = f"Stockfish {a.label}" if ruby_white else a.ruby_name
     game.headers["Result"] = "1/2-1/2" if winner is None else ("1-0" if winner == chess.WHITE else "0-1")
     game.headers["TimeControl"] = a.tc
     game.headers["Termination"] = reason
@@ -142,7 +146,7 @@ class Tally:
         if not n:
             return "No games finished."
         score = (self.wins + 0.5 * self.draws) / n
-        lines = [f"\nRuby vs Stockfish {self.a.label}: +{self.wins} ={self.draws} -{self.losses} "
+        lines = [f"\n{self.a.ruby_name} vs Stockfish {self.a.label}: +{self.wins} ={self.draws} -{self.losses} "
                  f"in {n} games, scoring {100 * score:.1f}%"]
         if self.wins == n or self.losses == n:
             side = "above" if self.wins == n else "below"
@@ -215,9 +219,9 @@ PLAY_HELP = ("Enter moves like Nf3, e4, O-O or g1f3. Other commands:\n"
 def play_human(a):
     human = {"white": chess.WHITE, "black": chess.BLACK}.get(a.color, random.choice([chess.WHITE, chess.BLACK]))
     ruby = chess.engine.SimpleEngine.popen_uci(a.ruby)
-    ruby.configure({"OwnBook": True, "Tablebase": True, "Hash": max(a.hash, 64)})
+    ruby.configure({"OwnBook": True, "Tablebase": True, "Hash": max(a.hash, 64), "Level": a.level})
     board, game_id, result, reason = chess.Board(), object(), "*", "unfinished"
-    print(f"You are {'White' if human == chess.WHITE else 'Black'}. Ruby thinks for {a.think:g} s per move.\n{PLAY_HELP}")
+    print(f"You are {'White' if human == chess.WHITE else 'Black'}. {a.ruby_name} thinks for up to {a.think:g} s per move.\n{PLAY_HELP}")
     try:
         while True:
             outcome = board.outcome(claim_draw=True)
@@ -227,7 +231,8 @@ def play_human(a):
             if board.turn != human:
                 played = ruby.play(board, chess.engine.Limit(time=a.think), info=chess.engine.INFO_SCORE, game=game_id)
                 score = played.info.get("score")
-                note = f"  (Ruby's eval: {score.pov(not human)})" if score else "  (book or tablebase move)"
+                note = (f"  (Ruby's eval: {score.pov(not human)})" if score
+                        else "" if a.level != "uncle_sam" else "  (book or tablebase move)")
                 print(f"\nRuby plays {board.san(played.move)}{note}")
                 board.push(played.move)
                 continue
@@ -265,14 +270,14 @@ def play_human(a):
     print(f"Result: {result} ({reason})")
     if board.move_stack:
         game = chess.pgn.Game.from_board(board)
-        game.headers["White"] = "You" if human == chess.WHITE else "Ruby"
-        game.headers["Black"] = "Ruby" if human == chess.WHITE else "You"
+        game.headers["White"] = "You" if human == chess.WHITE else a.ruby_name
+        game.headers["Black"] = a.ruby_name if human == chess.WHITE else "You"
         game.headers["Result"] = result
         game.headers["Termination"] = reason
         if a.pgn is None:
             os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
             stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            a.pgn = os.path.join(HERE, "results", f"you_vs_ruby_{stamp}.pgn")
+            a.pgn = os.path.join(HERE, "results", f"you_vs_{a.ruby_name.lower().replace(' ', '_')}_{stamp}.pgn")
         with open(a.pgn, "a", encoding="utf-8") as fh:
             print(game, file=fh, end="\n\n")
         print(f"Game saved to {a.pgn}")
@@ -283,6 +288,13 @@ def main():
     p.add_argument("--play", action="store_true", help="play Ruby yourself instead of running a match")
     p.add_argument("--color", choices=["white", "black", "random"], default="random", help="your side in --play")
     p.add_argument("--think", type=float, default=5.0, help="Ruby's seconds per move in --play")
+    levels = p.add_mutually_exclusive_group()
+    for flag, name, text in [("--blunderbuss", "blunderbuss", "weakest"),
+                             ("--furious_chicken", "furious_chicken", "second weakest"),
+                             ("--squidinator", "squidinator", "second strongest"),
+                             ("--uncle-sam", "uncle_sam", "full strength (default)")]:
+        levels.add_argument(flag, dest="level", action="store_const", const=name, help=f"Ruby's {text} level")
+    p.set_defaults(level="uncle_sam")
     p.add_argument("--elo", type=int, default=1800, help="Stockfish's limited strength (1320 or higher)")
     p.add_argument("--full", action="store_true", help="play Stockfish at full strength, ignoring --elo")
     p.add_argument("--games", type=int, default=200, help="total games, rounded up to an even number")
@@ -299,6 +311,7 @@ def main():
     p.add_argument("--book", default=DEFAULT_BOOK)
     p.add_argument("--pgn", default=None, help="where to save games (default: a new file in tests/results)")
     a = p.parse_args()
+    a.ruby_name = "Ruby" if a.level == "uncle_sam" else f"Ruby {a.level}"
     a.label = "full" if a.full else str(a.elo)
 
     if a.play:
@@ -319,7 +332,7 @@ def main():
     if a.pgn is None:
         os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        a.pgn = os.path.join(HERE, "results", f"ruby_vs_sf{a.label}_{stamp}.pgn")
+        a.pgn = os.path.join(HERE, "results", f"{a.ruby_name.lower().replace(' ', '_')}_vs_sf{a.label}_{stamp}.pgn")
 
     print(f"{a.games} games at {a.tc} against Stockfish {a.label} ({a.sf_threads} threads, {a.sf_hash or a.hash} MB hash), {a.concurrency} at once.\nGames save to {a.pgn}", flush=True)
     tally, errors, stopping = Tally(a), [], threading.Event()

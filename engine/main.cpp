@@ -3,6 +3,7 @@
 // Test commands (type these after starting ruby.exe):
 //   perfttest            check move generation against known correct counts
 //   evaltest <file>      compare evals with the values Python calculated
+//   updatetest           check move-by-move eval updates against evals calculated from scratch
 //   booktest             show what the opening book plays from the start position
 //   tbtest               ask the Lichess tablebase about a sample endgame
 //   bench                search some positions and report speed
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <random>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -27,6 +29,18 @@
 static Board board;
 static std::thread worker;
 static bool useBook = true, useTablebase = true;
+
+// Strength levels, weakest first. The last plays at full strength; the others score every move with
+// a shallow search and pick one at random, favouring better moves (see search::pickWeak).
+struct Level { const char* name; int depth, temperature, bookPlies; };
+static const Level LEVELS[] = {
+    {"blunderbuss",     2,  90,   6},          // about 1000 on Stockfish's scale
+    {"furious_chicken", 3,  55,   8},          // aiming for about 1300
+    {"squidinator",     5,  25,  12},          // aiming for about 1800
+    {"uncle_sam",       0,   0, 999},
+};
+static const int NUM_LEVELS = 4;
+static int level = NUM_LEVELS - 1;
 static std::string evalFile, bookFile;
 
 static std::string exeFolder() {
@@ -104,10 +118,15 @@ static void go(std::istringstream& in) {
     search::stopRequested = false;
     worker = std::thread([limits, infinite, remaining, moveTime] {
         Move choice = NO_MOVE;
+        const Level& lv = LEVELS[level];
+        bool full = level == NUM_LEVELS - 1;
+        int ply = (board.fullmove - 1) * 2 + board.side;
         // Book and tablebase are skipped for "go infinite", which means the user wants analysis.
         if (!infinite) {
-            if (useBook && book::pick(board, choice)) {
+            if (useBook && ply < lv.bookPlies && book::pick(board, choice)) {
                 std::cout << "info string book move" << std::endl;
+            } else if (!full) {
+                choice = search::pickWeak(board, lv.depth, lv.temperature);
             } else if (useTablebase && (moveTime >= 0 ? moveTime : remaining) > 3000 && board.pieceCount() <= 7) {
                 std::string category;
                 Move tbMove;
@@ -132,6 +151,10 @@ static void setOption(std::istringstream& in) {
     else if (name == "Tablebase") useTablebase = value == "true";
     else if (name == "EvalFile") { evalFile = value; loadNetwork(); }
     else if (name == "BookFile") { bookFile = value; book::load(bookFile); }
+    else if (name == "Level") {
+        for (int i = 0; i < NUM_LEVELS; i++)
+            if (value == LEVELS[i].name) level = i;
+    }
 }
 
 // ---------------------------------------------------------------- test commands
@@ -178,6 +201,53 @@ static void evalTest(const std::string& path) {
     }
     std::cout << "evaltest " << (failed || !total ? "FAILED" : "passed") << ": " << total
               << " positions, largest gap " << worst << " cp" << std::endl;
+}
+
+// Makes and unmakes random moves (and some null moves), evaluating only now and then so that
+// updates are chained across several moves, and compares each eval with a fresh board's.
+static void updateTest() {
+    static const char* fens[] = {
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    };
+    std::mt19937 rng(12345);
+    int checks = 0, failed = 0;
+    for (const char* fen : fens) {
+        Board test;
+        test.setFen(fen);
+        int made = 0;
+        std::vector<bool> wasNull;
+        for (int step = 0; step < 40000; step++) {
+            MoveList list;
+            test.legalMoves(list);
+            bool goBack = made > 0 && (list.size == 0 || made >= 30 || rng() % 3 == 0);
+            if (goBack) {
+                if (wasNull.back()) test.unmakeNull(); else test.unmake();
+                wasNull.pop_back();
+                made--;
+            } else if (!test.inCheck() && rng() % 10 == 0) {
+                test.makeNull();
+                wasNull.push_back(true);
+                made++;
+            } else if (list.size) {
+                test.make(list.moves[rng() % unsigned(list.size)]);
+                wasNull.push_back(false);
+                made++;
+            }
+            if (rng() % 4 == 0) {
+                Board fresh;
+                fresh.setFen(test.fen());
+                int got = nnue::evaluate(test), expected = nnue::evaluate(fresh);
+                checks++;
+                if (got != expected && ++failed <= 5)
+                    std::cout << "FAIL got " << got << ", expected " << expected << ": " << test.fen() << std::endl;
+            }
+        }
+    }
+    std::cout << "updatetest " << (failed ? "FAILED" : "passed") << ": " << checks << " positions checked" << std::endl;
 }
 
 static void bench() {
@@ -244,6 +314,8 @@ int main() {
                       << "option name Tablebase type check default true\n"
                       << "option name EvalFile type string default " << evalFile << "\n"
                       << "option name BookFile type string default " << bookFile << "\n"
+                      << "option name Level type combo default uncle_sam"
+                      << " var blunderbuss var furious_chicken var squidinator var uncle_sam\n"
                       << "uciok" << std::endl;
         } else if (cmd == "isready") {
             waitForSearch();
@@ -275,6 +347,7 @@ int main() {
             std::string path = folder + "tests\\eval_vectors.txt";
             in >> path;
             evalTest(path);
+        } else if (cmd == "updatetest") { updateTest();
         } else if (cmd == "bench") { bench();
         } else if (cmd == "booktest") { bookTest();
         } else if (cmd == "tbtest") { tablebaseTest();

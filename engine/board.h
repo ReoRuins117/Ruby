@@ -29,6 +29,17 @@ struct MoveList {
     void add(Move m) { moves[size++] = m; }
 };
 
+// The network's first layer for one position, from both sides' views. Each move adds and removes
+// at most two pieces, so a position's values are its parent's plus those few changes. They are
+// worked out only when the position is evaluated (see nnue.cpp).
+const int ACC_MAX = 512;
+struct Accumulator {
+    alignas(32) int16_t values[2][ACC_MAX];
+    bool computed;
+    uint8_t added, removed;                   // how many pieces this move added and removed
+    uint8_t addPiece[2], addSquare[2], removePiece[2], removeSquare[2];
+};
+
 struct Undo {
     uint64_t hash;
     Move move;
@@ -46,6 +57,10 @@ public:
     int fullmove;
     int king[2];
     uint64_t hash;
+
+    // acc[accTop] belongs to the current position, acc[accTop - 1] to the one before, and so on.
+    mutable std::vector<Accumulator> acc;
+    int accTop = 0;
 
     Board();
     bool setFen(const std::string& fen);
@@ -75,6 +90,8 @@ public:
 
 private:
     std::vector<Undo> history;
+    bool tracking = false;                    // record piece changes for the accumulator (inside make)
+    void pushAccumulator();
     void put(int square, int piece);
     void remove(int square);
     void addPawnMove(MoveList& list, int from, int to) const;

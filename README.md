@@ -75,6 +75,7 @@ Checkpoints and the exported `ruby_small.bin` go to `~/RubyTraining/small_nnue`.
 |---|---|
 | `perfttest` | Move generation against known perft counts |
 | `evaltest` | The C++ eval against `tests/eval_vectors.txt` |
+| `updatetest` | Move-by-move eval updates against evals calculated from scratch |
 | `booktest` | Opening book lookups |
 | `tbtest` | Lichess tablebase lookups |
 | `bench` | Search speed |
@@ -95,3 +96,16 @@ python engine/tests/elo_match.py --play
 | `Tablebase` | true | Use the Lichess tablebase API |
 | `EvalFile` | `ruby_small.bin` next to `ruby.exe` | Weights file |
 | `BookFile` | `Opening_Book.json` one folder above `ruby.exe` | Book file |
+| `Level` | `uncle_sam` | Playing strength (see below) |
+
+## Strength levels
+
+| Level | `elo_match.py` flag | Rough strength (Stockfish's scale) |
+|---|---|---|
+| `blunderbuss` | `--blunderbuss` | about 1000 |
+| `furious_chicken` | `--furious_chicken` | about 1300 |
+| `squidinator` | `--squidinator` | about 1900 |
+| `uncle_sam` | `--uncle-sam` (default) | full strength |
+
+The weaker levels score every move with a shallow search and pick one at random, favouring better
+moves, and use less of the opening book. For example, `python engine/tests/elo_match.py --play --squidinator`.
