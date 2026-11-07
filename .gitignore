@@ -1,0 +1,18 @@
+# Training data and downloads
+/parsed/
+/Normal/
+*.pgn
+*.zst
+
+# Not part of the project any more, or third-party
+/Old Programs/
+/Stockfish/
+
+# Build output and caches (rebuild ruby.exe with engine/build.bat on each computer)
+*.exe
+*.o
+__pycache__/
+*.pt
+
+# Match results
+/engine/tests/results/
