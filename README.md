@@ -109,3 +109,7 @@ python engine/tests/elo_match.py --play
 
 The weaker levels score every move with a shallow search and pick one at random, favouring better
 moves, and use less of the opening book. For example, `python engine/tests/elo_match.py --play --squidinator`.
+
+## License
+
+MIT. See `LICENSE`.
