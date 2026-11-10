@@ -1,6 +1,9 @@
 # Training data and downloads
 /parsed/
 /Normal/
+/parsed_bp/
+/binpacks/
+*.binpack
 *.pgn
 *.zst
 
