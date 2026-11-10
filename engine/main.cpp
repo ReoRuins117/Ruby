@@ -12,6 +12,7 @@
 #include "book.h"
 #include "nnue.h"
 #include "search.h"
+#include "syzygy.h"
 #include "tablebase.h"
 #include <algorithm>
 #include <chrono>
@@ -29,6 +30,8 @@
 static Board board;
 static std::thread worker;
 static bool useBook = true, useTablebase = true;
+static int64_t moveOverhead = 50;                   // spare milliseconds per move for GUI and network delays
+static std::string syzygyPath = "<empty>";
 
 // Strength levels, weakest first. The last plays at full strength; the others score every move with
 // a shallow search and pick one at random, favouring better moves (see search::pickWeak).
@@ -89,9 +92,10 @@ static void go(std::istringstream& in) {
     search::Limits limits;
     int64_t time[2] = {-1, -1}, increment[2] = {0, 0}, moveTime = -1;
     int movesToGo = 0;
-    bool infinite = false;
+    bool infinite = false, ponder = false;
     std::string word;
     while (in >> word) {
+        if (word == "ponder") ponder = true;
         if (word == "wtime") in >> time[WHITE];
         else if (word == "btime") in >> time[BLACK];
         else if (word == "winc") in >> increment[WHITE];
@@ -104,18 +108,22 @@ static void go(std::istringstream& in) {
     }
     limits.depth = std::clamp(limits.depth, 1, search::MAX_PLY - 1);
 
-    const int64_t overhead = 30;                    // spare milliseconds for GUI and system delays
-    int64_t remaining = time[board.side];
+    // Time: aim for about 1/35 of the clock plus most of the increment. The search stretches or
+    // shrinks that by how settled it is, but never past the hard limit, which keeps a reserve.
+    int64_t remaining = time[board.side], inc = increment[board.side];
     if (moveTime >= 0) {
-        limits.softMs = limits.hardMs = std::max<int64_t>(moveTime - overhead, 1);
+        limits.hardMs = std::max<int64_t>(moveTime - moveOverhead, 1);   // a fixed time: use all of it
     } else if (remaining >= 0) {
-        int64_t usable = std::max<int64_t>(remaining - overhead, 1);
-        int64_t target = usable / (movesToGo > 0 ? movesToGo + 1 : 30) + increment[board.side] * 3 / 4;
-        limits.softMs = std::min(target * 6 / 10, usable);
-        limits.hardMs = std::min(target * 3, usable / 2 + 1);
+        int64_t usable = std::max<int64_t>(remaining - moveOverhead, 1);
+        int mtg = movesToGo > 0 ? std::min(movesToGo, 50) : 35;
+        int64_t base = usable / mtg + inc * 3 / 4;
+        if (usable < 3 * inc) base = usable / 4;           // nearly flagging: the increment is all we have
+        limits.softMs = std::max<int64_t>(std::min(base, usable / 3), 1);
+        limits.hardMs = std::max<int64_t>(std::min(base * 4, usable / (movesToGo == 1 ? 2 : 4)), limits.softMs);
     }
 
     search::stopRequested = false;
+    search::pondering = ponder;
     worker = std::thread([limits, infinite, remaining, moveTime] {
         Move choice = NO_MOVE;
         const Level& lv = LEVELS[level];
@@ -127,17 +135,31 @@ static void go(std::istringstream& in) {
                 std::cout << "info string book move" << std::endl;
             } else if (!full) {
                 choice = search::pickWeak(board, lv.depth, lv.temperature);
-            } else if (useTablebase && (moveTime >= 0 ? moveTime : remaining) > 3000 && board.pieceCount() <= 7) {
+            } else {
                 std::string category;
                 Move tbMove;
-                if (tablebase::probe(board, tbMove, category)) {
+                if (board.pieceCount() <= syzygy::largest() && syzygy::probeRoot(board, tbMove, category)) {
                     choice = tbMove;
-                    std::cout << "info string tablebase says " << category << std::endl;
+                    std::cout << "info string syzygy says " << category << std::endl;
+                } else if (useTablebase && (moveTime >= 0 ? moveTime : remaining) > 10000 && board.pieceCount() <= 7
+                           && tablebase::probe(board, tbMove, category)) {
+                    choice = tbMove;
+                    std::cout << "info string online tablebase says " << category << std::endl;
                 }
             }
         }
-        if (choice == NO_MOVE) choice = search::think(board, limits, true).best;
-        std::cout << "bestmove " << (choice == NO_MOVE ? std::string("0000") : moveToUci(choice)) << std::endl;
+        Move ponderMove = NO_MOVE;
+        if (choice == NO_MOVE) {
+            search::Result r = search::think(board, limits, true);
+            choice = r.best;
+            ponderMove = r.ponder;
+        }
+        // UCI: while pondering or analysing, the answer waits for "ponderhit" or "stop".
+        while ((infinite || search::pondering) && !search::stopRequested)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::string line = "bestmove " + (choice == NO_MOVE ? std::string("0000") : moveToUci(choice));
+        if (ponderMove != NO_MOVE) line += " ponder " + moveToUci(ponderMove);
+        std::cout << line << std::endl;
     });
 }
 
@@ -147,6 +169,14 @@ static void setOption(std::istringstream& in) {
     while (in >> word && word != "value") name += (name.empty() ? "" : " ") + word;
     while (in >> word) value += (value.empty() ? "" : " ") + word;
     if (name == "Hash") search::setHashMb(std::atoi(value.c_str()));
+    else if (name == "Threads") search::setThreads(std::atoi(value.c_str()));
+    else if (name == "MoveOverhead") moveOverhead = std::max(0, std::atoi(value.c_str()));
+    else if (name == "Ponder") {}                   // nothing to set: "go ponder" says when to ponder
+    else if (name == "SyzygyPath") {
+        syzygyPath = value;
+        if (syzygy::init(value)) std::cout << "info string syzygy tables up to " << syzygy::largest() << " pieces" << std::endl;
+        else if (value != "<empty>" && !value.empty()) std::cout << "info string ERROR no syzygy tables in " << value << std::endl;
+    }
     else if (name == "OwnBook") useBook = value == "true";
     else if (name == "Tablebase") useTablebase = value == "true";
     else if (name == "EvalFile") { evalFile = value; loadNetwork(); }
@@ -309,7 +339,11 @@ int main() {
         in >> cmd;
         if (cmd == "uci") {
             std::cout << "id name Ruby\nid author Joshua\n"
-                      << "option name Hash type spin default 16 min 1 max 4096\n"
+                      << "option name Hash type spin default 16 min 1 max 16384\n"
+                      << "option name Threads type spin default 1 min 1 max 64\n"
+                      << "option name Ponder type check default false\n"
+                      << "option name MoveOverhead type spin default 50 min 0 max 5000\n"
+                      << "option name SyzygyPath type string default <empty>\n"
                       << "option name OwnBook type check default true\n"
                       << "option name Tablebase type check default true\n"
                       << "option name EvalFile type string default " << evalFile << "\n"
@@ -333,14 +367,18 @@ int main() {
             if (!nnue::loaded()) { std::cout << "info string ERROR no network loaded" << std::endl; continue; }
             if (useBook && !book::size()) book::load(bookFile);
             go(in);
+        } else if (cmd == "ponderhit") {
+            search::ponderHit();
         } else if (cmd == "stop") {
             search::stopRequested = true;
+            search::pondering = false;
             waitForSearch();
         } else if (cmd == "setoption") {
             waitForSearch();
             setOption(in);
         } else if (cmd == "quit") {
             search::stopRequested = true;
+            search::pondering = false;
             break;
         } else if (cmd == "perfttest") { perftTest();
         } else if (cmd == "evaltest") {

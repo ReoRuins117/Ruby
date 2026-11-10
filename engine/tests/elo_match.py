@@ -62,8 +62,20 @@ def parse_tc(text):
 
 
 def start_engines(a):
-    ruby = chess.engine.SimpleEngine.popen_uci(a.ruby)
-    ruby.configure({"OwnBook": False, "Tablebase": a.tablebase, "Hash": a.hash, "Level": a.level})
+    def ruby_engine(path, eval_file):
+        engine = chess.engine.SimpleEngine.popen_uci(path)
+        options = {"OwnBook": False, "Tablebase": a.tablebase, "Hash": a.hash, "Level": a.level,
+                   **({"EvalFile": eval_file} if eval_file else {})}
+        # Options only newer builds have (the old engine may lack them).
+        for name, value in (("Threads", a.threads), ("SyzygyPath", a.syzygy)):
+            if value and name in engine.options:
+                options[name] = value
+        engine.configure(options)
+        return engine
+
+    ruby = ruby_engine(a.ruby, a.eval)
+    if a.vs_eval or a.vs_ruby:                     # Ruby against another Ruby build or network, same settings
+        return ruby, ruby_engine(a.vs_ruby or a.ruby, a.vs_eval)
     stockfish = chess.engine.SimpleEngine.popen_uci(a.stockfish)
     limit = {} if a.full else {"UCI_LimitStrength": True, "UCI_Elo": a.elo}
     stockfish.configure({**limit, "Threads": a.sf_threads, "Hash": a.sf_hash or a.hash})
@@ -110,8 +122,8 @@ def play_game(a, ruby, stockfish, opening, ruby_white):
         board.push(move)
 
     game = chess.pgn.Game.from_board(board)
-    game.headers["White"] = a.ruby_name if ruby_white else f"Stockfish {a.label}"
-    game.headers["Black"] = f"Stockfish {a.label}" if ruby_white else a.ruby_name
+    game.headers["White"] = a.ruby_name if ruby_white else a.opp_name
+    game.headers["Black"] = a.opp_name if ruby_white else a.ruby_name
     game.headers["Result"] = "1/2-1/2" if winner is None else ("1-0" if winner == chess.WHITE else "0-1")
     game.headers["TimeControl"] = a.tc
     game.headers["Termination"] = reason
@@ -146,12 +158,12 @@ class Tally:
         if not n:
             return "No games finished."
         score = (self.wins + 0.5 * self.draws) / n
-        lines = [f"\n{self.a.ruby_name} vs Stockfish {self.a.label}: +{self.wins} ={self.draws} -{self.losses} "
+        lines = [f"\n{self.a.ruby_name} vs {self.a.opp_name}: +{self.wins} ={self.draws} -{self.losses} "
                  f"in {n} games, scoring {100 * score:.1f}%"]
         if self.wins == n or self.losses == n:
             side = "above" if self.wins == n else "below"
             lines.append(f"A clean sweep can't give an estimate: Ruby is well {side} this level."
-                         + ("" if self.a.full else " Try another --elo."))
+                         + ("" if self.a.full or self.a.vs_eval or self.a.vs_ruby else " Try another --elo."))
         elif score in (0.0, 1.0):
             lines.append("No estimate available.")
         else:
@@ -161,7 +173,7 @@ class Tally:
             low, high = max(score - 1.96 * sd, 0.001), min(score + 1.96 * sd, 0.999)
             to_elo = lambda s: -400 * math.log10(1 / s - 1)
             lines.append(f"Estimated difference {elo:+.0f} Elo (95% range {to_elo(low):+.0f} to {to_elo(high):+.0f})")
-            if not self.a.full:
+            if not (self.a.full or self.a.vs_eval or self.a.vs_ruby):
                 lines.append(f"Estimated Ruby strength at this time control: about {self.a.elo + elo:.0f} on Stockfish's scale")
         lines.append(f"How games ended: {self.reasons}")
         return "\n".join(lines)
@@ -310,9 +322,23 @@ def main():
     p.add_argument("--stockfish", default=DEFAULT_STOCKFISH)
     p.add_argument("--book", default=DEFAULT_BOOK)
     p.add_argument("--pgn", default=None, help="where to save games (default: a new file in tests/results)")
+    p.add_argument("--eval", default=None, help="network file for Ruby (default: ruby_small.bin next to ruby.exe)")
+    p.add_argument("--vs-eval", default=None, help="play Ruby with this network instead of Stockfish")
+    p.add_argument("--vs-ruby", default=None, help="play this Ruby executable instead of Stockfish")
+    p.add_argument("--threads", type=int, default=0, help="search threads for each Ruby (if it supports them)")
+    p.add_argument("--syzygy", default="", help="Syzygy tablebase folder for each Ruby (if it supports them)")
     a = p.parse_args()
     a.ruby_name = "Ruby" if a.level == "uncle_sam" else f"Ruby {a.level}"
     a.label = "full" if a.full else str(a.elo)
+    net = lambda path: os.path.basename(os.path.dirname(os.path.abspath(path)))   # e.g. mix_nnue
+    if a.eval:
+        a.ruby_name += f" ({net(a.eval)})"
+    a.opp_name = f"Stockfish {a.label}"
+    if a.vs_ruby:
+        a.ruby_name = f"Ruby {os.path.splitext(os.path.basename(a.ruby))[0]}"
+        a.opp_name = f"Ruby {os.path.splitext(os.path.basename(a.vs_ruby))[0]}"
+    elif a.vs_eval:
+        a.opp_name = f"Ruby ({net(a.vs_eval)})"
 
     if a.play:
         play_human(a)
@@ -332,9 +358,14 @@ def main():
     if a.pgn is None:
         os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        a.pgn = os.path.join(HERE, "results", f"{a.ruby_name.lower().replace(' ', '_')}_vs_sf{a.label}_{stamp}.pgn")
+        exe = lambda path: os.path.splitext(os.path.basename(path))[0]
+        name = (f"{exe(a.ruby)}_vs_{exe(a.vs_ruby)}" if a.vs_ruby
+                else f"{net(a.eval) if a.eval else 'ruby'}_vs_{net(a.vs_eval)}" if a.vs_eval
+                else f"{a.ruby_name.lower().replace(' ', '_').replace('(', '').replace(')', '')}_vs_sf{a.label}")
+        a.pgn = os.path.join(HERE, "results", f"{name}_{stamp}.pgn")
 
-    print(f"{a.games} games at {a.tc} against Stockfish {a.label} ({a.sf_threads} threads, {a.sf_hash or a.hash} MB hash), {a.concurrency} at once.\nGames save to {a.pgn}", flush=True)
+    against = a.opp_name if a.vs_eval or a.vs_ruby else f"{a.opp_name} ({a.sf_threads} threads, {a.sf_hash or a.hash} MB hash)"
+    print(f"{a.games} games at {a.tc} against {against}, {a.concurrency} at once.\nGames save to {a.pgn}", flush=True)
     tally, errors, stopping = Tally(a), [], threading.Event()
     threads = [threading.Thread(target=worker, args=(a, jobs, tally, a.pgn, errors, stopping), daemon=True)
                for _ in range(a.concurrency)]

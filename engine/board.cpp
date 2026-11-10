@@ -4,12 +4,31 @@
 #include <cstring>
 #include <sstream>
 
+const int SEE_VALUE[7] = {0, 100, 300, 300, 500, 900, 0};
+
 // ---------------------------------------------------------------- lookup tables
-static int8_t knightTargets[64][9], kingTargets[64][9];   // each list ends with -1
-static int8_t rayTargets[64][8][8];
-static int8_t rayLength[64][8];
+namespace attacks {
+Bitboard pawn[2][64], knight[64], king[64];
+
+// "Magic" lookups for sliding pieces: the pieces on a slider's lines are multiplied by a number
+// chosen so that every arrangement that matters lands in its own slot of a table of attacks.
+struct Magic {
+    Bitboard mask, magic;
+    Bitboard* table;
+    int shift;
+    unsigned index(Bitboard occupied) const { return unsigned(((occupied & mask) * magic) >> shift); }
+};
+static Magic bishopMagic[64], rookMagic[64];
+static Bitboard bishopTable[0x1480], rookTable[0x19000];
+
+Bitboard bishop(int square, Bitboard occupied) { const Magic& m = bishopMagic[square]; return m.table[m.index(occupied)]; }
+Bitboard rook(int square, Bitboard occupied) { const Magic& m = rookMagic[square]; return m.table[m.index(occupied)]; }
+}
+
 static int castleMask[64];
 static uint64_t zPiece[13][64], zCastle[16], zEp[8], zSide;
+static const Bitboard RANK_1 = 0xFFULL;
+static const Bitboard FILE_A = 0x0101010101010101ULL;
 
 static uint64_t nextRandom(uint64_t& x) {                 // splitmix64: fixed seed, same keys every run
     uint64_t z = (x += 0x9E3779B97F4A7C15ULL);
@@ -18,35 +37,79 @@ static uint64_t nextRandom(uint64_t& x) {                 // splitmix64: fixed s
     return z ^ (z >> 31);
 }
 
-static void buildSteps(int8_t table[64][9], const int (*steps)[2]) {
-    for (int sq = 0; sq < 64; sq++) {
-        int n = 0;
-        for (int i = 0; i < 8; i++) {
-            int f = (sq & 7) + steps[i][0], r = (sq >> 3) + steps[i][1];
-            if (f >= 0 && f < 8 && r >= 0 && r < 8) table[sq][n++] = int8_t(r * 8 + f);
+// Attacks along the given directions, stopping at (and including) the first piece in each.
+static Bitboard slowSlider(int square, Bitboard occupied, const int (*dirs)[2]) {
+    Bitboard result = 0;
+    for (int d = 0; d < 4; d++) {
+        int f = square & 7, r = square >> 3;
+        for (;;) {
+            f += dirs[d][0];
+            r += dirs[d][1];
+            if (f < 0 || f > 7 || r < 0 || r > 7) break;
+            result |= bit(r * 8 + f);
+            if (occupied & bit(r * 8 + f)) break;
         }
-        table[sq][n] = -1;
+    }
+    return result;
+}
+
+static void initMagics(attacks::Magic* magics, Bitboard* table, const int (*dirs)[2], uint64_t& seed) {
+    static Bitboard occupancy[4096], reference[4096];
+    static int epoch[4096], attempt = 0;                  // shared by both calls, so stale marks never match
+    Bitboard* next = table;
+    for (int sq = 0; sq < 64; sq++) {
+        // Edge squares never change what a slider can reach, so they're left out of the mask.
+        Bitboard edges = ((RANK_1 | (RANK_1 << 56)) & ~(RANK_1 << ((sq >> 3) * 8)))
+                       | ((FILE_A | (FILE_A << 7)) & ~(FILE_A << (sq & 7)));
+        attacks::Magic& m = magics[sq];
+        m.mask = slowSlider(sq, 0, dirs) & ~edges;
+        m.shift = 64 - popCount(m.mask);
+        m.table = next;
+        int size = 0;
+        Bitboard b = 0;
+        do {                                               // every subset of the mask
+            occupancy[size] = b;
+            reference[size++] = slowSlider(sq, b, dirs);
+            b = (b - m.mask) & m.mask;
+        } while (b);
+        next += size;
+        for (int i = 0; i < size;) {
+            do m.magic = nextRandom(seed) & nextRandom(seed) & nextRandom(seed);
+            while (popCount((m.mask * m.magic) >> 56) < 6);
+            attempt++;
+            for (i = 0; i < size; i++) {
+                unsigned idx = m.index(occupancy[i]);
+                if (epoch[idx] < attempt) { epoch[idx] = attempt; m.table[idx] = reference[i]; }
+                else if (m.table[idx] != reference[i]) break;
+            }
+        }
     }
 }
 
 namespace {
 struct TableSetup {
     TableSetup() {
-        static const int knight[8][2] = {{1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}};
-        static const int kingMoves[8][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
-        buildSteps(knightTargets, knight);
-        buildSteps(kingTargets, kingMoves);
-        for (int sq = 0; sq < 64; sq++)
-            for (int d = 0; d < 8; d++) {                 // directions 0-3 are rook lines, 4-7 bishop lines
-                int f = sq & 7, r = sq >> 3, n = 0;
-                for (;;) {
-                    f += kingMoves[d][0];
-                    r += kingMoves[d][1];
-                    if (f < 0 || f > 7 || r < 0 || r > 7) break;
-                    rayTargets[sq][d][n++] = int8_t(r * 8 + f);
-                }
-                rayLength[sq][d] = int8_t(n);
+        static const int knightSteps[8][2] = {{1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}};
+        static const int kingSteps[8][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        static const int rookDirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        static const int bishopDirs[4][2] = {{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        for (int sq = 0; sq < 64; sq++) {
+            int f = sq & 7, r = sq >> 3;
+            for (int i = 0; i < 8; i++) {
+                int nf = f + knightSteps[i][0], nr = r + knightSteps[i][1];
+                if (nf >= 0 && nf < 8 && nr >= 0 && nr < 8) attacks::knight[sq] |= bit(nr * 8 + nf);
+                nf = f + kingSteps[i][0], nr = r + kingSteps[i][1];
+                if (nf >= 0 && nf < 8 && nr >= 0 && nr < 8) attacks::king[sq] |= bit(nr * 8 + nf);
             }
+            if (r < 7 && f > 0) attacks::pawn[WHITE][sq] |= bit(sq + 7);
+            if (r < 7 && f < 7) attacks::pawn[WHITE][sq] |= bit(sq + 9);
+            if (r > 0 && f > 0) attacks::pawn[BLACK][sq] |= bit(sq - 9);
+            if (r > 0 && f < 7) attacks::pawn[BLACK][sq] |= bit(sq - 7);
+        }
+        uint64_t magicSeed = 728;
+        initMagics(attacks::bishopMagic, attacks::bishopTable, bishopDirs, magicSeed);
+        initMagics(attacks::rookMagic, attacks::rookTable, rookDirs, magicSeed);
+
         for (int& m : castleMask) m = 15;
         castleMask[0] = 15 & ~CASTLE_WQ;                  // a1
         castleMask[7] = 15 & ~CASTLE_WK;                  // h1
@@ -83,16 +146,21 @@ void Board::put(int square, int piece) {
         a.addSquare[a.added++] = uint8_t(square);
     }
     squares[square] = int8_t(piece);
+    pieces[piece] |= bit(square);
+    colors[colorOf(piece)] |= bit(square);
     hash ^= zPiece[piece][square];
 }
 
 void Board::remove(int square) {
+    int piece = squares[square];
     if (tracking) {
         Accumulator& a = acc[size_t(accTop)];
-        a.removePiece[a.removed] = uint8_t(squares[square]);
+        a.removePiece[a.removed] = uint8_t(piece);
         a.removeSquare[a.removed++] = uint8_t(square);
     }
-    hash ^= zPiece[squares[square]][square];
+    hash ^= zPiece[piece][square];
+    pieces[piece] &= ~bit(square);
+    colors[colorOf(piece)] &= ~bit(square);
     squares[square] = EMPTY;
 }
 
@@ -113,6 +181,8 @@ bool Board::setFen(const std::string& text) {
     if (placement.empty() || (turn != "w" && turn != "b")) return false;
 
     std::memset(squares, 0, sizeof(squares));
+    std::memset(pieces, 0, sizeof(pieces));
+    colors[WHITE] = colors[BLACK] = 0;
     history.clear();
     if (acc.empty()) acc.resize(256);
     accTop = 0;
@@ -254,22 +324,34 @@ void Board::unmake() {
     side ^= 1;
     if (side == BLACK) fullmove--;
 
+    // Undoing doesn't need the hash or accumulator bookkeeping, so set squares directly.
+    auto lift = [this](int sq) {
+        int p = squares[sq];
+        pieces[p] &= ~bit(sq);
+        colors[colorOf(p)] &= ~bit(sq);
+        squares[sq] = EMPTY;
+        return p;
+    };
+    auto drop = [this](int sq, int p) {
+        squares[sq] = int8_t(p);
+        pieces[p] |= bit(sq);
+        colors[colorOf(p)] |= bit(sq);
+    };
+
     int from = fromSq(u.move), to = toSq(u.move);
-    int piece = squares[to];
+    int piece = lift(to);
     if (promoOf(u.move)) piece = makePiece(side, PAWN);
-    squares[to] = EMPTY;
-    squares[from] = int8_t(piece);
+    drop(from, piece);
     int type = typeOf(piece);
 
-    if (type == PAWN && to == u.ep) {
-        squares[to + (side == WHITE ? -8 : 8)] = u.captured;
-    } else {
-        squares[to] = u.captured;
+    if (u.captured) {
+        if (type == PAWN && to == u.ep) drop(to + (side == WHITE ? -8 : 8), u.captured);
+        else drop(to, u.captured);
     }
     if (type == KING) {
         king[side] = from;
-        if (to - from == 2) { squares[to + 1] = squares[to - 1]; squares[to - 1] = EMPTY; }
-        if (from - to == 2) { squares[to - 2] = squares[to + 1]; squares[to + 1] = EMPTY; }
+        if (to - from == 2) drop(to + 1, lift(to - 1));
+        if (from - to == 2) drop(to - 2, lift(to + 1));
     }
     castling = u.castling;
     ep = u.ep;
@@ -306,92 +388,138 @@ void Board::unmakeNull() {
 
 // ---------------------------------------------------------------- attacks and moves
 bool Board::attacked(int sq, int by) const {
-    int file = sq & 7, rank = sq >> 3;
-    if (by == WHITE) {
-        if (rank > 0 && file > 0 && squares[sq - 9] == WP) return true;
-        if (rank > 0 && file < 7 && squares[sq - 7] == WP) return true;
-    } else {
-        if (rank < 7 && file > 0 && squares[sq + 7] == BP) return true;
-        if (rank < 7 && file < 7 && squares[sq + 9] == BP) return true;
-    }
-    int theirKnight = makePiece(by, KNIGHT), theirKing = makePiece(by, KING);
-    for (const int8_t* t = knightTargets[sq]; *t >= 0; t++) if (squares[*t] == theirKnight) return true;
-    for (const int8_t* t = kingTargets[sq]; *t >= 0; t++) if (squares[*t] == theirKing) return true;
-
-    int queen = makePiece(by, QUEEN);
-    for (int d = 0; d < 8; d++) {
-        int slider = makePiece(by, d < 4 ? ROOK : BISHOP);
-        for (int i = 0; i < rayLength[sq][d]; i++) {
-            int piece = squares[rayTargets[sq][d][i]];
-            if (!piece) continue;
-            if (piece == slider || piece == queen) return true;
-            break;
-        }
-    }
-    return false;
+    Bitboard occ = occupied();
+    return (attacks::pawn[by ^ 1][sq] & pieces[makePiece(by, PAWN)])
+        || (attacks::knight[sq] & pieces[makePiece(by, KNIGHT)])
+        || (attacks::king[sq] & pieces[makePiece(by, KING)])
+        || (attacks::bishop(sq, occ) & (pieces[makePiece(by, BISHOP)] | pieces[makePiece(by, QUEEN)]))
+        || (attacks::rook(sq, occ) & (pieces[makePiece(by, ROOK)] | pieces[makePiece(by, QUEEN)]));
 }
 
-void Board::addPawnMove(MoveList& list, int from, int to) const {
-    if ((to >> 3) == 0 || (to >> 3) == 7) {
-        list.add(makeMove(from, to, QUEEN));
-        list.add(makeMove(from, to, ROOK));
-        list.add(makeMove(from, to, BISHOP));
-        list.add(makeMove(from, to, KNIGHT));
-    } else {
-        list.add(makeMove(from, to));
+Bitboard Board::attackersTo(int sq, Bitboard occ) const {
+    Bitboard diagonal = pieces[WB] | pieces[BB] | pieces[WQ] | pieces[BQ];
+    Bitboard straight = pieces[WR] | pieces[BR] | pieces[WQ] | pieces[BQ];
+    return (attacks::pawn[BLACK][sq] & pieces[WP]) | (attacks::pawn[WHITE][sq] & pieces[BP])
+         | (attacks::knight[sq] & (pieces[WN] | pieces[BN]))
+         | (attacks::king[sq] & (pieces[WK] | pieces[BK]))
+         | (attacks::bishop(sq, occ) & diagonal) | (attacks::rook(sq, occ) & straight);
+}
+
+// Plays out the exchange on the destination square, each side recapturing with its cheapest
+// piece, and stops as soon as one side would rather not continue.
+bool Board::see(Move m, int threshold) const {
+    int from = fromSq(m), to = toSq(m);
+    if (promoOf(m) || (to == ep && typeOf(squares[from]) == PAWN)) return threshold <= 0;
+    int swap = SEE_VALUE[typeOf(squares[to])] - threshold;
+    if (swap < 0) return false;
+    swap = SEE_VALUE[typeOf(squares[from])] - swap;
+    if (swap <= 0) return true;
+
+    Bitboard occ = occupied() ^ bit(from) ^ bit(to);
+    Bitboard attackers = attackersTo(to, occ);
+    Bitboard diagonal = pieces[WB] | pieces[BB] | pieces[WQ] | pieces[BQ];
+    Bitboard straight = pieces[WR] | pieces[BR] | pieces[WQ] | pieces[BQ];
+    int stm = side, result = 1;
+    for (;;) {
+        stm ^= 1;
+        attackers &= occ;
+        Bitboard mine = attackers & colors[stm];
+        if (!mine) break;
+        result ^= 1;
+        Bitboard b;
+        if ((b = mine & pieces[makePiece(stm, PAWN)])) {
+            if ((swap = SEE_VALUE[PAWN] - swap) < result) break;
+            occ ^= b & -b;
+            attackers |= attacks::bishop(to, occ) & diagonal;
+        } else if ((b = mine & pieces[makePiece(stm, KNIGHT)])) {
+            if ((swap = SEE_VALUE[KNIGHT] - swap) < result) break;
+            occ ^= b & -b;
+        } else if ((b = mine & pieces[makePiece(stm, BISHOP)])) {
+            if ((swap = SEE_VALUE[BISHOP] - swap) < result) break;
+            occ ^= b & -b;
+            attackers |= attacks::bishop(to, occ) & diagonal;
+        } else if ((b = mine & pieces[makePiece(stm, ROOK)])) {
+            if ((swap = SEE_VALUE[ROOK] - swap) < result) break;
+            occ ^= b & -b;
+            attackers |= attacks::rook(to, occ) & straight;
+        } else if ((b = mine & pieces[makePiece(stm, QUEEN)])) {
+            if ((swap = SEE_VALUE[QUEEN] - swap) < result) break;
+            occ ^= b & -b;
+            attackers |= (attacks::bishop(to, occ) & diagonal) | (attacks::rook(to, occ) & straight);
+        } else {                                          // only the king is left
+            return (attackers & ~colors[stm]) ? result ^ 1 : result;
+        }
     }
+    return result;
+}
+
+static inline void addPromotions(MoveList& list, int from, int to) {
+    list.add(makeMove(from, to, QUEEN));
+    list.add(makeMove(from, to, ROOK));
+    list.add(makeMove(from, to, BISHOP));
+    list.add(makeMove(from, to, KNIGHT));
 }
 
 void Board::generate(MoveList& list, bool capturesOnly) const {
-    int enemy = side ^ 1;
-    for (int sq = 0; sq < 64; sq++) {
-        int piece = squares[sq];
-        if (!piece || colorOf(piece) != side) continue;
-        int type = typeOf(piece);
+    const int us = side, them = side ^ 1;
+    const Bitboard occ = occupied(), enemies = colors[them], empty = ~occ;
+    const Bitboard targets = capturesOnly ? enemies : ~colors[us];
 
-        if (type == PAWN) {
-            int forward = side == WHITE ? 8 : -8, file = sq & 7, rank = sq >> 3;
-            int one = sq + forward;
-            bool promotes = (one >> 3) == 0 || (one >> 3) == 7;
-            if (!squares[one] && (!capturesOnly || promotes)) {
-                addPawnMove(list, sq, one);
-                int two = one + forward;
-                if (rank == (side == WHITE ? 1 : 6) && !squares[two]) list.add(makeMove(sq, two));
-            }
-            for (int delta = -1; delta <= 1; delta += 2) {
-                if ((delta < 0 && file == 0) || (delta > 0 && file == 7)) continue;
-                int to = one + delta;
-                if (to == ep || (squares[to] && colorOf(squares[to]) == enemy)) addPawnMove(list, sq, to);
-            }
-        } else if (type == KNIGHT || type == KING) {
-            for (const int8_t* t = (type == KNIGHT ? knightTargets : kingTargets)[sq]; *t >= 0; t++) {
-                int target = squares[*t];
-                if (target ? colorOf(target) == enemy : !capturesOnly) list.add(makeMove(sq, *t));
-            }
-        } else {
-            int first = type == BISHOP ? 4 : 0, last = type == ROOK ? 4 : 8;
-            for (int d = first; d < last; d++)
-                for (int i = 0; i < rayLength[sq][d]; i++) {
-                    int to = rayTargets[sq][d][i], target = squares[to];
-                    if (target) {
-                        if (colorOf(target) == enemy) list.add(makeMove(sq, to));
-                        break;
-                    }
-                    if (!capturesOnly) list.add(makeMove(sq, to));
-                }
-        }
+    // Pawns
+    const int up = us == WHITE ? 8 : -8;
+    const Bitboard lastRank = us == WHITE ? RANK_1 << 48 : RANK_1 << 8;    // pawns about to promote
+    const Bitboard thirdRank = us == WHITE ? RANK_1 << 16 : RANK_1 << 40;
+    auto forward = [us](Bitboard b) { return us == WHITE ? b << 8 : b >> 8; };
+    Bitboard pawns = byType(us, PAWN);
+    Bitboard promoting = pawns & lastRank, normal = pawns & ~lastRank;
+    if (!capturesOnly) {
+        Bitboard one = forward(normal) & empty;
+        Bitboard two = forward(one & thirdRank) & empty;
+        while (one) { int to = popLsb(one); list.add(makeMove(to - up, to)); }
+        while (two) { int to = popLsb(two); list.add(makeMove(to - 2 * up, to)); }
+    }
+    for (Bitboard b = normal; b;) {
+        int from = popLsb(b);
+        Bitboard caps = attacks::pawn[us][from] & enemies;
+        if (ep >= 0) caps |= attacks::pawn[us][from] & bit(ep);
+        while (caps) list.add(makeMove(from, popLsb(caps)));
+    }
+    for (Bitboard b = promoting; b;) {
+        int from = popLsb(b);
+        if (empty & bit(from + up)) addPromotions(list, from, from + up);
+        for (Bitboard caps = attacks::pawn[us][from] & enemies; caps;) addPromotions(list, from, popLsb(caps));
     }
 
+    // Pieces
+    for (Bitboard b = byType(us, KNIGHT); b;) {
+        int from = popLsb(b);
+        for (Bitboard t = attacks::knight[from] & targets; t;) list.add(makeMove(from, popLsb(t)));
+    }
+    for (Bitboard b = byType(us, BISHOP); b;) {
+        int from = popLsb(b);
+        for (Bitboard t = attacks::bishop(from, occ) & targets; t;) list.add(makeMove(from, popLsb(t)));
+    }
+    for (Bitboard b = byType(us, ROOK); b;) {
+        int from = popLsb(b);
+        for (Bitboard t = attacks::rook(from, occ) & targets; t;) list.add(makeMove(from, popLsb(t)));
+    }
+    for (Bitboard b = byType(us, QUEEN); b;) {
+        int from = popLsb(b);
+        for (Bitboard t = attacks::queen(from, occ) & targets; t;) list.add(makeMove(from, popLsb(t)));
+    }
+    int k = king[us];
+    for (Bitboard t = attacks::king[k] & targets; t;) list.add(makeMove(k, popLsb(t)));
+
     if (capturesOnly) return;
-    int home = side == WHITE ? 4 : 60;                    // e1 or e8
-    int kingSide = side == WHITE ? CASTLE_WK : CASTLE_BK, queenSide = side == WHITE ? CASTLE_WQ : CASTLE_BQ;
-    if (king[side] != home || attacked(home, enemy)) return;
-    int rook = makePiece(side, ROOK);
+    int home = us == WHITE ? 4 : 60;                      // e1 or e8
+    int kingSide = us == WHITE ? CASTLE_WK : CASTLE_BK, queenSide = us == WHITE ? CASTLE_WQ : CASTLE_BQ;
+    if (k != home || !(castling & (kingSide | queenSide)) || attacked(home, them)) return;
+    int rook = makePiece(us, ROOK);
     if ((castling & kingSide) && squares[home + 3] == rook && !squares[home + 1] && !squares[home + 2]
-        && !attacked(home + 1, enemy) && !attacked(home + 2, enemy))
+        && !attacked(home + 1, them) && !attacked(home + 2, them))
         list.add(makeMove(home, home + 2));
     if ((castling & queenSide) && squares[home - 4] == rook && !squares[home - 1] && !squares[home - 2]
-        && !squares[home - 3] && !attacked(home - 1, enemy) && !attacked(home - 2, enemy))
+        && !squares[home - 3] && !attacked(home - 1, them) && !attacked(home - 2, them))
         list.add(makeMove(home, home - 2));
 }
 
@@ -417,33 +545,18 @@ bool Board::parseUci(const std::string& text, Move& out) {
 bool Board::isRepetition() const {
     int n = int(history.size());
     int reach = n < halfmove ? n : halfmove;              // nothing before the last pawn move or capture can repeat
-    for (int back = 2; back <= reach; back += 2)
+    for (int back = 4; back <= reach; back += 2)
         if (history[n - back].hash == hash) return true;
     return false;
 }
 
 bool Board::insufficientMaterial() const {
-    int minors = 0;
-    for (int sq = 0; sq < 64; sq++) {
-        int type = typeOf(squares[sq]);
-        if (type == PAWN || type == ROOK || type == QUEEN) return false;
-        if (type == KNIGHT || type == BISHOP) minors++;
-    }
-    return minors <= 1;
+    if (pieces[WP] | pieces[BP] | pieces[WR] | pieces[BR] | pieces[WQ] | pieces[BQ]) return false;
+    return popCount(pieces[WN] | pieces[BN] | pieces[WB] | pieces[BB]) <= 1;
 }
 
 bool Board::hasNonPawnMaterial(int color) const {
-    for (int sq = 0; sq < 64; sq++) {
-        int piece = squares[sq];
-        if (piece && colorOf(piece) == color && typeOf(piece) != PAWN && typeOf(piece) != KING) return true;
-    }
-    return false;
-}
-
-int Board::pieceCount() const {
-    int n = 0;
-    for (int sq = 0; sq < 64; sq++) n += squares[sq] != EMPTY;
-    return n;
+    return colors[color] & ~(pieces[makePiece(color, PAWN)] | pieces[makePiece(color, KING)]);
 }
 
 uint64_t Board::perft(int depth) {
