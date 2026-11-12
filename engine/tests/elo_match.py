@@ -22,8 +22,14 @@ Each opening is played twice with colours swapped, so neither side gets a luckie
 Openings come from Opening_Book.json. Ruby's own book is turned off because the shared opening
 replaces it. Its tablebase is off unless you pass --tablebase, because a long match would send
 Lichess a lot of requests. Needs python-chess.
+
+SPRT (for testing a change against the previous build): stop as soon as the games show, with the
+chosen error rates, whether the change gains at least --elo1 or at most --elo0 Elo. Games are
+counted in pairs (both colours of one opening), which removes most of the opening luck:
+
+  python elo_match.py --ruby new_ruby.exe --vs-ruby ruby.exe --tc 10+0.1 --sprt --elo0 0 --elo1 5
 """
-import argparse, datetime, math, os, queue, random, threading, time
+import argparse, datetime, math, os, queue, random, sys, threading, time
 import chess, chess.engine, chess.pgn
 import json
 
@@ -33,6 +39,7 @@ ROOT = os.path.dirname(ENGINE_DIR)
 DEFAULT_RUBY = os.path.join(ENGINE_DIR, "ruby.exe")
 DEFAULT_STOCKFISH = os.path.join(ROOT, "Stockfish", "stockfish-windows-x86-64-avx2.exe")
 DEFAULT_BOOK = os.path.join(ROOT, "Opening_Book.json")
+MIN_SPRT_PAIRS = 20      # the variance estimate is unreliable with fewer finished pairs
 
 
 def make_openings(book, count, plies, rng):
@@ -140,12 +147,18 @@ class Tally:
         self.a, self.wins, self.draws, self.losses = a, 0, 0, 0
         self.reasons, self.lock = {}, threading.Lock()
 
+        self.pairs = {}                   # opening -> Ruby's scores in that opening so far
+        self.penta = [0] * 5              # finished pairs scoring 0, 0.5, 1, 1.5 and 2
+        self.verdict = None               # set when the SPRT finishes
+
     @property
     def games(self):
         return self.wins + self.draws + self.losses
 
-    def add(self, score, reason, game, pgn_path):
+    def add(self, score, reason, game, pgn_path, pair, stopping):
         with self.lock:
+            if self.verdict:
+                return                     # games still running when the SPRT finished don't count
             self.wins += score == 1
             self.draws += score == 0.5
             self.losses += score == 0
@@ -153,8 +166,36 @@ class Tally:
             self.reasons[label] = self.reasons.get(label, 0) + 1
             with open(pgn_path, "a", encoding="utf-8") as fh:
                 print(game, file=fh, end="\n\n")
+            scores = self.pairs.setdefault(pair, [])
+            scores.append(score)
+            if len(scores) == 2:
+                self.penta[round(2 * sum(scores))] += 1
+            sprt = ""
+            if self.a.sprt:
+                llr, low, high = self.llr()
+                sprt = f" | LLR {llr:+.2f} ({low:+.2f}, {high:+.2f})"
+                if sum(self.penta) >= MIN_SPRT_PAIRS and (llr >= high or llr <= low):
+                    self.verdict = "H1" if llr >= high else "H0"
+                    stopping.set()
             print(f"game {self.games}/{self.a.games}: {'win' if score == 1 else 'draw' if score else 'loss'} "
-                  f"({reason}) | +{self.wins} ={self.draws} -{self.losses}", flush=True)
+                  f"({reason}) | +{self.wins} ={self.draws} -{self.losses}{sprt}", flush=True)
+
+    def llr(self):
+        """Log-likelihood ratio of elo1 against elo0 from the game pairs (normal approximation, as in
+        fishtest's GSPRT), and the bounds that end the test."""
+        a = self.a
+        low, high = math.log(a.beta / (1 - a.alpha)), math.log((1 - a.beta) / a.alpha)
+        n = sum(self.penta)
+        if n < 2:
+            return 0.0, low, high
+        counts = [c + 1e-3 for c in self.penta]        # keeps the variance above zero early on
+        total = sum(counts)
+        values = [i / 4 for i in range(5)]           # a pair's average score
+        mean = sum(c * v for c, v in zip(counts, values)) / total
+        var = sum(c * (v - mean) ** 2 for c, v in zip(counts, values)) / total
+        expected = lambda elo: 1 / (1 + 10 ** (-elo / 400))
+        s0, s1 = expected(a.elo0), expected(a.elo1)
+        return n * (s1 - s0) * (2 * mean - s0 - s1) / (2 * var), low, high
 
     def summary(self):
         n = self.games
@@ -179,6 +220,13 @@ class Tally:
             if not (self.a.full or self.a.vs_eval or self.a.vs_ruby):
                 lines.append(f"Estimated Ruby strength at this time control: about {self.a.elo + elo:.0f} on Stockfish's scale")
         lines.append(f"How games ended: {self.reasons}")
+        if self.a.sprt:
+            llr, low, high = self.llr()
+            lines.append(f"Game pairs scoring 0 / 0.5 / 1 / 1.5 / 2: {' / '.join(map(str, self.penta))}")
+            outcome = {"H1": f"PASSED: the change is likely worth at least {self.a.elo1:g} Elo",
+                       "H0": f"FAILED: the change is likely worth {self.a.elo0:g} Elo or less"}.get(
+                self.verdict, "UNFINISHED: not enough games to decide")
+            lines.append(f"SPRT [{self.a.elo0:g}, {self.a.elo1:g}] LLR {llr:+.2f} ({low:+.2f}, {high:+.2f}): {outcome}")
         return "\n".join(lines)
 
 
@@ -187,12 +235,12 @@ def worker(a, jobs, tally, pgn_path, errors, stopping):
     try:
         while not stopping.is_set():
             try:
-                opening, ruby_white = jobs.get_nowait()
+                pair, opening, ruby_white = jobs.get_nowait()
             except queue.Empty:
                 return
             try:
                 score, reason, game = play_game(a, ruby, stockfish, opening, ruby_white)
-                tally.add(score, reason, game, pgn_path)
+                tally.add(score, reason, game, pgn_path, pair, stopping)
             except (chess.engine.EngineError, chess.engine.EngineTerminatedError, TimeoutError) as e:
                 errors.append(repr(e))                         # a crash or illegal move: report it, carry on
                 print(f"ENGINE ERROR, game not counted: {e!r}", flush=True)
@@ -336,7 +384,14 @@ def main():
                                                              "told, like lichess-bot's move_overhead")
     p.add_argument("--option", action="append", default=[], metavar="NAME=VALUE",
                    help="UCI option for each Ruby, set only if that build has it (repeatable)")
+    p.add_argument("--sprt", action="store_true", help="stop when the SPRT decides; --games becomes the most to play")
+    p.add_argument("--elo0", type=float, default=0, help="SPRT: Elo gain that counts as no improvement")
+    p.add_argument("--elo1", type=float, default=5, help="SPRT: Elo gain worth detecting")
+    p.add_argument("--alpha", type=float, default=0.05, help="SPRT: chance of passing a change that isn't better")
+    p.add_argument("--beta", type=float, default=0.05, help="SPRT: chance of failing a change that is better")
     a = p.parse_args()
+    if a.sprt and "--games" not in " ".join(sys.argv):
+        a.games = 20000
     a.extra_options = [tuple(o.split("=", 1)) for o in a.option if "=" in o]
     a.ruby_name ="Ruby" if a.level == "uncle_sam" else f"Ruby {a.level}"
     a.label = "full" if a.full else str(a.elo)
@@ -361,9 +416,9 @@ def main():
     openings = make_openings(book, pairs, a.opening_plies, random.Random(a.seed))
     del book
     jobs = queue.Queue()
-    for opening in openings:
-        jobs.put((opening, True))
-        jobs.put((opening, False))
+    for pair, opening in enumerate(openings):
+        jobs.put((pair, opening, True))
+        jobs.put((pair, opening, False))
 
     if a.pgn is None:
         os.makedirs(os.path.join(HERE, "results"), exist_ok=True)

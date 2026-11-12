@@ -87,6 +87,13 @@ python engine/tests/elo_match.py --elo 2500 --games 100
 python engine/tests/elo_match.py --play
 ```
 
+To test a change, play the new build against the old one with an SPRT, which stops as soon as the
+result is clear (here: is the change worth at least 5 Elo, or 0 or less?):
+
+```
+python engine/tests/elo_match.py --ruby C:/path/new_ruby.exe --vs-ruby C:/path/ruby.exe --tc 10+0.1 --sprt --elo0 0 --elo1 5
+```
+
 ## UCI options
 
 | Option | Default | Meaning |
