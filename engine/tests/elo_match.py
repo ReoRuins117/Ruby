@@ -67,7 +67,7 @@ def start_engines(a):
         options = {"OwnBook": False, "Tablebase": a.tablebase, "Hash": a.hash, "Level": a.level,
                    **({"EvalFile": eval_file} if eval_file else {})}
         # Options only newer builds have (the old engine may lack them).
-        for name, value in (("Threads", a.threads), ("SyzygyPath", a.syzygy)):
+        for name, value in (("Threads", a.threads), ("SyzygyPath", a.syzygy), *a.extra_options):
             if value and name in engine.options:
                 options[name] = value
         engine.configure(options)
@@ -110,11 +110,14 @@ def play_game(a, ruby, stockfish, opening, ruby_white):
             reason, winner = outcome.termination.name.lower(), outcome.winner
             break
         mover = board.turn
-        limit = chess.engine.Limit(white_clock=clock[chess.WHITE], black_clock=clock[chess.BLACK],
+        # Like lichess-bot, hold back --reserve from the clocks the engines are told.
+        shown = {side: max(clock[side] - a.reserve / 1000, 0.001) for side in clock}
+        limit = chess.engine.Limit(white_clock=shown[chess.WHITE], black_clock=shown[chess.BLACK],
                                    white_inc=inc, black_inc=inc)
         started = time.perf_counter()
         move = players[mover].play(board, limit, game=game_id).move
-        clock[mover] -= time.perf_counter() - started
+        # --latency stands in for the time a move takes to reach Lichess, which the mover pays for.
+        clock[mover] -= time.perf_counter() - started + a.latency / 1000
         if clock[mover] <= 0:
             reason, winner = "lost_on_time", not mover
             break
@@ -327,8 +330,15 @@ def main():
     p.add_argument("--vs-ruby", default=None, help="play this Ruby executable instead of Stockfish")
     p.add_argument("--threads", type=int, default=0, help="search threads for each Ruby (if it supports them)")
     p.add_argument("--syzygy", default="", help="Syzygy tablebase folder for each Ruby (if it supports them)")
+    p.add_argument("--latency", type=float, default=0, help="milliseconds charged to each side's clock per move, "
+                                                             "like the delay of playing on Lichess")
+    p.add_argument("--reserve", type=float, default=0, help="milliseconds held back from the clock each engine is "
+                                                             "told, like lichess-bot's move_overhead")
+    p.add_argument("--option", action="append", default=[], metavar="NAME=VALUE",
+                   help="UCI option for each Ruby, set only if that build has it (repeatable)")
     a = p.parse_args()
-    a.ruby_name = "Ruby" if a.level == "uncle_sam" else f"Ruby {a.level}"
+    a.extra_options = [tuple(o.split("=", 1)) for o in a.option if "=" in o]
+    a.ruby_name ="Ruby" if a.level == "uncle_sam" else f"Ruby {a.level}"
     a.label = "full" if a.full else str(a.elo)
     net = lambda path: os.path.basename(os.path.dirname(os.path.abspath(path)))   # e.g. mix_nnue
     if a.eval:
