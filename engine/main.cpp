@@ -393,6 +393,10 @@ int main() {
         } else if (cmd == "d") { std::cout << board.fen() << std::endl;
         }
     }
+    // Input closed (the GUI quit or was killed): end any ponder or infinite search, which would
+    // otherwise wait forever for a "stop" that can no longer arrive.
+    search::stopRequested = true;
+    search::pondering = false;
     waitForSearch();
     return 0;
 }
