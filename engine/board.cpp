@@ -169,7 +169,7 @@ void Board::pushAccumulator() {
     accTop++;
     if (size_t(accTop) >= acc.size()) acc.resize(acc.size() * 2);
     Accumulator& a = acc[size_t(accTop)];
-    a.computed = false;
+    a.computed[WHITE] = a.computed[BLACK] = false;
     a.added = a.removed = 0;
 }
 
@@ -186,7 +186,7 @@ bool Board::setFen(const std::string& text) {
     history.clear();
     if (acc.empty()) acc.resize(256);
     accTop = 0;
-    acc[0].computed = false;                              // worked out from scratch when first needed
+    acc[0].computed[WHITE] = acc[0].computed[BLACK] = false;   // worked out from scratch when first needed
     acc[0].added = acc[0].removed = 0;
     hash = 0;
     king[WHITE] = king[BLACK] = -1;

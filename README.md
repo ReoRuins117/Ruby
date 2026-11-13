@@ -20,7 +20,8 @@ That puts Ruby at about 2935 on Stockfish's limited-strength scale.
 
 | Path | What it is |
 |---|---|
-| `train.py` | Trains the network from `parsed/dataset` and exports `ruby_small.bin` |
+| `train.py` | Trains the network from shard folders and exports `ruby_small.bin` |
+| `convert_binpack.py` | Converts Stockfish `.binpack` training data into shards for `train.py` |
 | `Opening_Book.json` | Opening book, keyed by FEN |
 | `engine/` | The C++ engine: board, move generation, search, NNUE evaluation, book, tablebase |
 | `engine/ruby_small.bin` | Trained weights |
@@ -32,10 +33,16 @@ The training data is not included.
 
 ## Network
 
-768 inputs (piece and square) feed a 256-wide feature layer, used once from the side to move's
-view and once from the opponent's. The two halves are joined (512) and go through 32 -> 32 -> 1,
-with clipped ReLU throughout. The output is in units of 400 centipawns. The weights are stored as
-integers; the file format is documented at the top of `train.py`.
+The current network (v3) has 8 king buckets: each side's own king position picks one of 8 sets
+of 768 inputs (piece and square), 6144 in all. The board is mirrored left-right when that king is
+on files e-h. They feed a 512-wide feature layer, used once from the side to move's view and once
+from the opponent's. The two halves are joined (1024) and go through 32 -> 32 -> 1, with clipped
+ReLU throughout. The output is in units of 400 centipawns. The weights are stored as integers;
+the file format (version 1 without buckets, version 2 with) is documented at the top of
+`train.py`. The engine reads both versions.
+
+v3 was trained on Stockfish training data (Leela games rescored by Stockfish) and beat the
+previous 256-wide network by about 26 Elo in an SPRT at 8+0.08.
 
 ## Search
 
@@ -61,11 +68,16 @@ build.bat
 Needs Python with numpy and torch, and a GPU for reasonable speed.
 
 ```
-python train.py
+python convert_binpack.py calibrate path/to/file.binpack
+python convert_binpack.py convert path/to/file.binpack --scale <from calibrate> --out-dir path/to/shards
+python train.py --buckets 8 --hidden 512 --wdl 0.25 --data path/to/shards --data more/shards
 ```
 
-Checkpoints and the exported `ruby_small.bin` go to `~/RubyTraining/small_nnue`. See
-`python train.py --help` for options.
+v3 used those settings, with `--pass-size 130000000 --epochs 24`. `--data` can be given several
+times; data is streamed from disk, so it can be bigger than memory, and folders are re-scanned
+before each pass so a running conversion's new shards are picked up. Checkpoints and the exported
+weights go to `--out` (default `~/RubyTraining/small_nnue`). See `python train.py --help` for all
+options.
 
 ## Testing
 
@@ -76,6 +88,7 @@ Checkpoints and the exported `ruby_small.bin` go to `~/RubyTraining/small_nnue`.
 | `perfttest` | Move generation against known perft counts |
 | `evaltest` | The C++ eval against `tests/eval_vectors.txt` |
 | `updatetest` | Move-by-move eval updates against evals calculated from scratch |
+| `evalspeed [noeval]` | Times evals along a fixed random walk of moves, to compare networks |
 | `booktest` | Opening book lookups |
 | `tbtest` | Lichess tablebase lookups |
 | `bench` | Search speed |

@@ -48,11 +48,12 @@ struct MoveList {
 
 // The network's first layer for one position, from both sides' views. Each move adds and removes
 // at most two pieces, so a position's values are its parent's plus those few changes. They are
-// worked out only when the position is evaluated (see nnue.cpp).
-const int ACC_MAX = 512;
+// worked out only when the position is evaluated, separately for each view (see nnue.cpp).
+const int ACC_MAX = 1024;
 struct Accumulator {
     alignas(32) int16_t values[2][ACC_MAX];
-    bool computed;
+    bool computed[2];                         // per view: values[view] is up to date
+    uint8_t kingKey[2];                       // per view: king bucket * 2 + mirrored, once computed
     uint8_t added, removed;                   // how many pieces this move added and removed
     uint8_t addPiece[2], addSquare[2], removePiece[2], removeSquare[2];
 };

@@ -4,6 +4,7 @@
 //   perfttest            check move generation against known correct counts
 //   evaltest <file>      compare evals with the values Python calculated
 //   updatetest           check move-by-move eval updates against evals calculated from scratch
+//   evalspeed            time move-by-move evals along a fixed random walk (compares networks)
 //   booktest             show what the opening book plays from the start position
 //   tbtest               ask the Lichess tablebase about a sample endgame
 //   bench                search some positions and report speed
@@ -280,6 +281,40 @@ static void updateTest() {
     std::cout << "updatetest " << (failed ? "FAILED" : "passed") << ": " << checks << " positions checked" << std::endl;
 }
 
+// Makes and unmakes random moves, as a search does, and evaluates every position. The walk is
+// the same for every network, so the time per eval compares networks fairly.
+static void evalSpeed(bool withEval = true) {
+    static const char* fens[] = {
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    };
+    std::mt19937 rng(777);
+    long long evals = 0, checksum = 0;
+    auto start = std::chrono::steady_clock::now();
+    for (const char* fen : fens) {
+        Board test;
+        test.setFen(fen);
+        int made = 0;
+        for (int step = 0; step < 300000; step++) {
+            MoveList list;
+            test.legalMoves(list);
+            if (made > 0 && (list.size == 0 || made >= 12 || rng() % 2 == 0)) {
+                test.unmake();
+                made--;
+            } else if (list.size) {
+                test.make(list.moves[rng() % unsigned(list.size)]);
+                made++;
+            }
+            if (withEval) checksum += nnue::evaluate(test);
+            evals++;
+        }
+    }
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::cout << evals << " evals in " << int(ms) << " ms (including move generation) = "
+              << int(evals / ms * 1000) << " per second, checksum " << checksum << std::endl;
+}
+
 static void bench() {
     static const char* fens[] = {
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -387,6 +422,7 @@ int main() {
             evalTest(path);
         } else if (cmd == "updatetest") { updateTest();
         } else if (cmd == "bench") { bench();
+        } else if (cmd == "evalspeed") { std::string arg; in >> arg; evalSpeed(arg != "noeval");
         } else if (cmd == "booktest") { bookTest();
         } else if (cmd == "tbtest") { tablebaseTest();
         } else if (cmd == "eval") { std::cout << nnue::evaluate(board) << " cp" << std::endl;

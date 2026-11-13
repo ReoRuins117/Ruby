@@ -19,7 +19,7 @@ import train
 def read_weights(path):
     with open(path, "rb") as fh:
         magic, version, inputs, hidden, hidden2 = struct.unpack("<4sIIII", fh.read(20))
-        assert magic == b"RUBY" and version == 1 and inputs == 768, "unexpected weights file"
+        assert magic == b"RUBY" and (version, inputs) in ((1, 768), (2, 6144)), "unexpected weights file"
 
         def take(dtype, *shape):
             data = np.frombuffer(fh.read(int(np.prod(shape)) * np.dtype(dtype).itemsize), dtype=dtype)

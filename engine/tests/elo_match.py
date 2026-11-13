@@ -44,8 +44,9 @@ MIN_SPRT_PAIRS = 20      # the variance estimate is unreliable with fewer finish
 
 def make_openings(book, count, plies, rng):
     """Random book lines, favouring moves that were played often."""
-    openings, seen = [], set()
+    openings, seen, tries = [], set(), 0
     while len(openings) < count:
+        tries += 1
         board = chess.Board()
         for _ in range(plies):
             entry = book.get(board.fen())
@@ -57,7 +58,8 @@ def make_openings(book, count, plies, rng):
                 break
             board.push_uci(rng.choices([m for m, _ in common], [n for _, n in common])[0])
         key = " ".join(m.uci() for m in board.move_stack)
-        if key not in seen or len(seen) > 50000:
+        # The book only has so many distinct lines; once new ones stop turning up, allow repeats.
+        if key not in seen or tries > 20 * count:
             seen.add(key)
             openings.append(list(board.move_stack))
     return openings
@@ -117,14 +119,19 @@ def play_game(a, ruby, stockfish, opening, ruby_white):
             reason, winner = outcome.termination.name.lower(), outcome.winner
             break
         mover = board.turn
-        # Like lichess-bot, hold back --reserve from the clocks the engines are told.
-        shown = {side: max(clock[side] - a.reserve / 1000, 0.001) for side in clock}
+        # Like lichess-bot, hold back the mover's reserve (--reserve for Ruby, --vs-reserve for the
+        # opponent) from the mover's own clock before telling the engine.
+        ruby_moving = (mover == chess.WHITE) == ruby_white
+        reserve = a.reserve if ruby_moving else a.vs_reserve
+        shown = dict(clock)
+        shown[mover] = max(clock[mover] - reserve / 1000, 0.001)
         limit = chess.engine.Limit(white_clock=shown[chess.WHITE], black_clock=shown[chess.BLACK],
                                    white_inc=inc, black_inc=inc)
         started = time.perf_counter()
         move = players[mover].play(board, limit, game=game_id).move
         # --latency stands in for the time a move takes to reach Lichess, which the mover pays for.
-        clock[mover] -= time.perf_counter() - started + a.latency / 1000
+        lag = a.latency + (random.expovariate(1 / a.latency_spread) if a.latency_spread else 0)
+        clock[mover] -= time.perf_counter() - started + lag / 1000
         if clock[mover] <= 0:
             reason, winner = "lost_on_time", not mover
             break
@@ -382,6 +389,9 @@ def main():
                                                              "like the delay of playing on Lichess")
     p.add_argument("--reserve", type=float, default=0, help="milliseconds held back from the clock each engine is "
                                                              "told, like lichess-bot's move_overhead")
+    p.add_argument("--vs-reserve", type=float, default=None, help="--reserve for the opponent (default: the same)")
+    p.add_argument("--latency-spread", type=float, default=0, help="average extra milliseconds of random delay per "
+                                                                    "move on top of --latency (exponentially spread)")
     p.add_argument("--option", action="append", default=[], metavar="NAME=VALUE",
                    help="UCI option for each Ruby, set only if that build has it (repeatable)")
     p.add_argument("--sprt", action="store_true", help="stop when the SPRT decides; --games becomes the most to play")
@@ -392,6 +402,8 @@ def main():
     a = p.parse_args()
     if a.sprt and "--games" not in " ".join(sys.argv):
         a.games = 20000
+    if a.vs_reserve is None:
+        a.vs_reserve = a.reserve
     a.extra_options = [tuple(o.split("=", 1)) for o in a.option if "=" in o]
     a.ruby_name ="Ruby" if a.level == "uncle_sam" else f"Ruby {a.level}"
     a.label = "full" if a.full else str(a.elo)

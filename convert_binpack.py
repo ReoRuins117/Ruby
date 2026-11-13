@@ -425,12 +425,14 @@ def cmd_convert(a):
             json.dump(prog, fh)
         os.replace(prog_path + ".tmp", prog_path)
 
-    jobs = [(path, o, s, a) for o, s in offs[done:]]
+    # --chunk-step K converts every K-th chunk, which spreads a smaller sample over the whole file.
+    picked = list(range(done, len(offs), a.chunk_step))
+    jobs = [(path, *offs[k], a) for k in picked]
     i = done
     with mp.Pool(a.workers) as pool:
         try:
-            for part in pool.imap(convert_chunk, jobs):
-                i += 1
+            for k, part in zip(picked, pool.imap(convert_chunk, jobs)):
+                i = k + 1
                 if "bad" in part:
                     st["bad_chunks"] = st.get("bad_chunks", 0) + 1
                     print(f"SKIPPED a chunk that failed to decode ({st['bad_chunks']} so far): {part.pop('bad')}",
@@ -438,7 +440,7 @@ def cmd_convert(a):
                 parts.append(part); n_parts += len(part["cp"]); conv += len(part["cp"])
                 if n_parts >= a.shard_size:
                     flush(i)
-                if i % 20 == 0:
+                if (k // a.chunk_step) % 20 == 0:
                     rate = conv / (time.time() - t0)
                     print(f"chunks {i:,}/{len(offs):,} | kept {prog['kept'] + n_parts:,} | {rate:,.0f} positions/s",
                           flush=True)
@@ -470,6 +472,7 @@ def main(argv=None):
     c.add_argument("--scale", type=float, required=True, help="from `calibrate`")
     c.add_argument("--every", type=int, default=1, help="keep 1 in K positions (spreads data over more games)")
     c.add_argument("--max-positions", type=int, default=100_000_000)
+    c.add_argument("--chunk-step", type=int, default=1, help="convert every K-th chunk only")
     c.add_argument("--workers", type=int, default=4)
     c.add_argument("--shard-size", type=int, default=1_000_000)
     c.add_argument("--out-dir", default=os.path.join(HERE, "parsed_bp"))
