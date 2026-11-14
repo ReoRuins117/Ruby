@@ -5,6 +5,7 @@ train.py - train Ruby's NNUE evaluation network and export it for the C++ engine
   python train.py                  # train (30 passes) and export weights for the C engine
   python train.py --resume         # continue from the last finished pass in --out
   python train.py --export-only    # re-export the best checkpoint in --out
+  python train.py --init run/best.pt --lr 3e-4 --epochs 6 --out run_ft   # fine-tune a finished run
 
   # the bigger network: king buckets, 512 wide, several data folders, 25% game result
   python train.py --buckets 8 --hidden 512 --data parsed/dataset_mix --data D:/more_shards
@@ -398,6 +399,14 @@ def train(a, device):
         opt.load_state_dict(ck["opt"])
         first_epoch, step, best = ck["epoch"] + 1, ck["step"], ck["best"]
         print(f"Resuming after pass {first_epoch}.")
+    elif a.init:
+        # Fine-tuning: start from another run's weights, with a new optimizer and schedule.
+        ck = torch.load(a.init, map_location=device)
+        if (ck["hidden"], ck.get("buckets", 1)) != (a.hidden, a.buckets):
+            sys.exit(f"ERROR: {a.init} has --hidden {ck['hidden']} --buckets {ck.get('buckets', 1)}, "
+                     f"but this run uses {a.hidden} and {a.buckets}.")
+        model.load_state_dict(ck["model"])
+        print(f"Starting from the weights in {a.init}.")
 
     steps_per_epoch = math.ceil(per_pass / a.batch_size)
     total_steps = steps_per_epoch * a.epochs
@@ -493,6 +502,8 @@ def main():
                    help="positions read and shuffled together (memory: about 140 bytes each)")
     p.add_argument("--print-every", type=int, default=200, help="steps between progress lines")
     p.add_argument("--resume", action="store_true", help="continue from last.pt in --out")
+    p.add_argument("--init", default=None, metavar="CHECKPOINT",
+                   help="fine-tune: start from this .pt file's weights with a fresh schedule (use a lower --lr)")
     p.add_argument("--export-only", action="store_true", help="re-export best.pt without training")
     p.add_argument("--export-name", default="ruby_small.bin", help="file name of the exported weights in --out")
     p.add_argument("--cpu", action="store_true", help="run without the GPU")

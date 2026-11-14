@@ -42,7 +42,8 @@ the file format (version 1 without buckets, version 2 with) is documented at the
 `train.py`. The engine reads both versions.
 
 v3 was trained on Stockfish training data (Leela games rescored by Stockfish) and beat the
-previous 256-wide network by about 26 Elo in an SPRT at 8+0.08.
+previous 256-wide network by about 26 Elo in an SPRT at 8+0.08. The current file is v3 fine-tuned
+for 6 more passes at a lower learning rate, which beat v3 by about 19 Elo in the same test.
 
 ## Search
 
@@ -73,7 +74,9 @@ python convert_binpack.py convert path/to/file.binpack --scale <from calibrate> 
 python train.py --buckets 8 --hidden 512 --wdl 0.25 --data path/to/shards --data more/shards
 ```
 
-v3 used those settings, with `--pass-size 130000000 --epochs 24`. `--data` can be given several
+v3 used those settings, with `--pass-size 130000000 --epochs 24`. It was then fine-tuned with
+`--init <v3 run>/best.pt --lr 3e-4 --epochs 6` (same other settings), which starts from a finished
+run's weights with a fresh optimizer and schedule. `--data` can be given several
 times; data is streamed from disk, so it can be bigger than memory, and folders are re-scanned
 before each pass so a running conversion's new shards are picked up. Checkpoints and the exported
 weights go to `--out` (default `~/RubyTraining/small_nnue`). See `python train.py --help` for all
