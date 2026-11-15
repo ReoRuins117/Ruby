@@ -19,3 +19,8 @@ __pycache__/
 
 # Match results
 /engine/tests/results/
+
+# fastchess state (written where it runs) and local backups of older networks
+config.json
+/engine/ruby_small_v*.bin
+/engine/ruby_v3ft.bin

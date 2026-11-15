@@ -27,6 +27,7 @@ That puts Ruby at about 2935 on Stockfish's limited-strength scale.
 | `engine/ruby_small.bin` | Trained weights |
 | `engine/build.bat` | Builds `ruby.exe` |
 | `engine/tests/elo_match.py` | Matches against Stockfish, and `--play` to play Ruby yourself |
+| `engine/tests/fast_sprt.py` | Tests one build against another with fastchess |
 | `engine/tests/make_eval_vectors.py` | Makes `eval_vectors.txt` to check the C++ eval matches Python |
 
 The training data is not included.
@@ -104,6 +105,7 @@ options.
 | `booktest` | Opening book lookups |
 | `tbtest` | Lichess tablebase lookups |
 | `bench` | Search speed |
+| `tunables` | Lists the tunable search numbers (name, int, value, min, max, step, rate) for SPSA |
 
 Matches against Stockfish (needs python-chess and a Stockfish executable):
 
@@ -119,6 +121,26 @@ result is clear (here: is the change worth at least 5 Elo, or 0 or less?):
 python engine/tests/elo_match.py --ruby C:/path/new_ruby.exe --vs-ruby C:/path/ruby.exe --tc 10+0.1 --sprt --elo0 0 --elo1 5
 ```
 
+`--openings` takes openings from an `.epd` or `.pgn` file instead of `Opening_Book.json`, which only
+has a few hundred distinct lines. The test sets from
+[official-stockfish/books](https://github.com/official-stockfish/books) (CC0) work well:
+`UHO_Lichess_4852_v1.epd` (unbalanced starting positions, so fewer draws) or `8moves_v3.pgn`
+(balanced).
+
+`fast_sprt.py` runs the same kind of test with [fastchess](https://github.com/Disservin/fastchess),
+whose low overhead keeps short time controls such as 2+0.02 free of time losses, so tests can run
+several times faster than at 8+0.08. Build fastchess from source (`mingw32-make`, then link with
+`-static`) and put it on PATH or at `~/RubyData/tools/fastchess.exe`; openings default to
+`~/RubyData/books/UHO_Lichess_4852_v1.epd`:
+
+```
+python engine/tests/fast_sprt.py engine/new_ruby.exe engine/ruby.exe --tc 2+0.02
+python engine/tests/fast_sprt.py engine/ruby.exe engine/ruby.exe --option RfpMargin=90
+```
+
+fastchess may warn "Bestmove does not match beginning of last PV". That is expected: when time
+runs out partway through a depth, Ruby plays the better move that depth has already found.
+
 ## UCI options
 
 | Option | Default | Meaning |
@@ -129,6 +151,7 @@ python engine/tests/elo_match.py --ruby C:/path/new_ruby.exe --vs-ruby C:/path/r
 | `EvalFile` | `ruby_small.bin` next to `ruby.exe` | Weights file |
 | `BookFile` | `Opening_Book.json` one folder above `ruby.exe` | Book file |
 | `Level` | `uncle_sam` | Playing strength (see below) |
+| `QsFutility`, `RfpMargin`, `LmrDiv`, ... | (tuned values) | The search's margins and reductions, for tuning with SPSA; `tunables` lists them all with their ranges |
 
 ## Strength levels
 

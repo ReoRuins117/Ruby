@@ -19,7 +19,7 @@ In --play mode Ruby uses its own opening book and the Lichess tablebase, and spe
 per move. Your clock isn't timed.
 
 Each opening is played twice with colours swapped, so neither side gets a luckier set of positions.
-Openings come from Opening_Book.json. Ruby's own book is turned off because the shared opening
+Openings come from Opening_Book.json, or from an .epd/.pgn opening set with --openings. Ruby's own book is turned off because the shared opening
 replaces it. Its tablebase is off unless you pass --tablebase, because a long match would send
 Lichess a lot of requests. Needs python-chess.
 
@@ -61,8 +61,30 @@ def make_openings(book, count, plies, rng):
         # The book only has so many distinct lines; once new ones stop turning up, allow repeats.
         if key not in seen or tries > 20 * count:
             seen.add(key)
-            openings.append(list(board.move_stack))
+            openings.append((chess.STARTING_FEN, list(board.move_stack)))
     return openings
+
+
+def load_openings(path, count, rng):
+    """Random openings from an EPD file (one position per line) or a PGN file (each game's moves),
+    as (starting FEN, moves). The file is used as it is: --opening-plies does not apply."""
+    if path.lower().endswith(".pgn"):
+        lines = []
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            while (game := chess.pgn.read_game(fh)) is not None:
+                lines.append((game.board().fen(), list(game.mainline_moves())))
+    else:
+        with open(path, encoding="utf-8") as fh:
+            lines = [l.strip() for l in fh if l.strip()]
+    chosen = rng.sample(lines, count) if count <= len(lines) else rng.choices(lines, k=count)
+    if path.lower().endswith(".pgn"):
+        return chosen
+    def position(line):                      # a full FEN, or EPD (four fields and optional opcodes)
+        f = line.split()
+        if len(f) >= 6 and f[4].isdigit() and f[5].isdigit():
+            return chess.Board(" ".join(f[:6])).fen()
+        return chess.Board.from_epd(line)[0].fen()
+    return [(position(l), []) for l in chosen]
 
 
 def parse_tc(text):
@@ -105,8 +127,9 @@ def stop_engines(*engines):
 def play_game(a, ruby, stockfish, opening, ruby_white):
     """Returns (result from Ruby's view: 1, 0.5 or 0; how it ended; the PGN game)."""
     base, inc = parse_tc(a.tc)
-    board = chess.Board()
-    for move in opening:
+    fen, moves = opening
+    board = chess.Board(fen)
+    for move in moves:
         board.push(move)
     clock = {chess.WHITE: base, chess.BLACK: base}
     players = {chess.WHITE: ruby if ruby_white else stockfish, chess.BLACK: stockfish if ruby_white else ruby}
@@ -379,6 +402,9 @@ def main():
     p.add_argument("--ruby", default=DEFAULT_RUBY)
     p.add_argument("--stockfish", default=DEFAULT_STOCKFISH)
     p.add_argument("--book", default=DEFAULT_BOOK)
+    p.add_argument("--openings", default=None, metavar="FILE",
+                   help="take openings from this .epd or .pgn file instead of --book (for example "
+                        "8moves_v3.pgn or UHO_Lichess_4852_v1.epd from github.com/official-stockfish/books)")
     p.add_argument("--pgn", default=None, help="where to save games (default: a new file in tests/results)")
     p.add_argument("--eval", default=None, help="network file for Ruby (default: ruby_small.bin next to ruby.exe)")
     p.add_argument("--vs-eval", default=None, help="play Ruby with this network instead of Stockfish")
@@ -421,12 +447,15 @@ def main():
         play_human(a)
         return
 
-    with open(a.book) as fh:
-        book = json.load(fh)
     pairs = (a.games + 1) // 2
     a.games = pairs * 2
-    openings = make_openings(book, pairs, a.opening_plies, random.Random(a.seed))
-    del book
+    if a.openings:
+        openings = load_openings(a.openings, pairs, random.Random(a.seed))
+    else:
+        with open(a.book) as fh:
+            book = json.load(fh)
+        openings = make_openings(book, pairs, a.opening_plies, random.Random(a.seed))
+        del book
     jobs = queue.Queue()
     for pair, opening in enumerate(openings):
         jobs.put((pair, opening, True))
