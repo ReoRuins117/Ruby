@@ -7,9 +7,10 @@ train.py - train Ruby's NNUE evaluation network and export it for the C++ engine
   python train.py --export-only    # re-export the best checkpoint in --out
   python train.py --init run/best.pt --lr 3e-4 --epochs 6 --out run_ft   # fine-tune a finished run
 
-  # the bigger network: king buckets, 512 wide, several data folders, 25% game result
+  # the bigger network (v3): king buckets, 512 wide, several data folders, 25% game result
   python train.py --buckets 8 --hidden 512 --data parsed/dataset_mix --data D:/more_shards
-                  --val parsed/dataset_mix --wdl 0.25 --epochs 12 --out ~/RubyTraining/v3
+                  --val parsed/dataset_mix --wdl 0.25 --pass-size 130000000 --epochs 24
+                  --out ~/RubyTraining/v3
 
 Needs numpy and torch. Stop any time with Ctrl+C; finished passes are kept.
 
