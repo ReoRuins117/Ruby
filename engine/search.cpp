@@ -49,6 +49,7 @@ const int EVAL_NONE = 32001;
 struct TTData {
     Move move;
     int score, eval, depth, bound, gen;
+    bool pv;                                              // the position has been on a principal variation
 };
 
 // An entry is stored as two 64-bit words, the first being the key mixed with the second. A slot
@@ -64,13 +65,14 @@ static std::unique_ptr<TTBucket[]> table;
 static size_t tableSize = 0;
 static uint8_t generation = 0;
 
-static uint64_t pack(Move m, int score, int eval, int depth, int bound) {
+static uint64_t pack(Move m, int score, int eval, int depth, int bound, bool pv) {
     return uint64_t(m) | uint64_t(uint16_t(int16_t(score))) << 16 | uint64_t(uint16_t(int16_t(eval))) << 32
-         | uint64_t(uint8_t(depth)) << 48 | uint64_t(bound) << 56 | uint64_t(generation & 63) << 58;
+         | uint64_t(uint8_t(depth)) << 48 | uint64_t(bound) << 56 | uint64_t(generation & 31) << 58 | uint64_t(pv) << 63;
 }
 
 static TTData unpack(uint64_t d) {
-    return {Move(d & 0xFFFF), int16_t(d >> 16), int16_t(d >> 32), int((d >> 48) & 0xFF), int((d >> 56) & 3), int(d >> 58)};
+    return {Move(d & 0xFFFF), int16_t(d >> 16), int16_t(d >> 32), int((d >> 48) & 0xFF), int((d >> 56) & 3),
+            int((d >> 58) & 31), bool(d >> 63)};
 }
 
 static TTBucket& bucketFor(uint64_t key) {
@@ -85,7 +87,7 @@ static bool ttProbe(uint64_t key, TTData& out) {
     return false;
 }
 
-static void ttStore(uint64_t key, Move m, int score, int eval, int depth, int bound) {
+static void ttStore(uint64_t key, Move m, int score, int eval, int depth, int bound, bool pv = false) {
     depth = std::clamp(depth, 0, 255);
     TTBucket& b = bucketFor(key);
     TTSlot* target = nullptr;
@@ -95,16 +97,16 @@ static void ttStore(uint64_t key, Move m, int score, int eval, int depth, int bo
         TTData old = unpack(d);
         if ((c ^ d) == key && d) {
             // Keep a much deeper result for this position unless the new one is exact.
-            if (bound != BOUND_EXACT && depth + 3 < old.depth && old.gen == (generation & 63)) return;
+            if (bound != BOUND_EXACT && depth + 3 < old.depth && old.gen == (generation & 31)) return;
             if (m == NO_MOVE) m = old.move;
             if (eval == EVAL_NONE) eval = old.eval;
             target = &s;
             break;
         }
-        int value = d ? old.depth - 8 * ((generation - old.gen) & 63) : INT_MIN;   // replace old, shallow ones
+        int value = d ? old.depth - 8 * ((generation - old.gen) & 31) : INT_MIN;   // replace old, shallow ones
         if (value < worst) { worst = value; target = &s; }
     }
-    uint64_t d = pack(m, score, eval, depth, bound);
+    uint64_t d = pack(m, score, eval, depth, bound, pv);
     target->data.store(d, std::memory_order_relaxed);
     target->check.store(key ^ d, std::memory_order_relaxed);
 }
@@ -119,7 +121,7 @@ static int hashFull() {                                   // per mille of the ta
     for (size_t i = 0; i < 500 && i < tableSize; i++)
         for (TTSlot& s : table[i].slot) {
             uint64_t d = s.data.load(std::memory_order_relaxed);
-            used += d && unpack(d).gen == (generation & 63);
+            used += d && unpack(d).gen == (generation & 31);
         }
     return used;
 }
@@ -165,6 +167,7 @@ struct Stack {
     int piece = 0, to = 0;                                // the move played from this ply
     Move killers[2] = {NO_MOVE, NO_MOVE};
     int doubleExtensions = 0;
+    bool ttPv = false;
 };
 
 const int SCORE_TT = 1 << 30, SCORE_GOOD_NOISY = 1 << 28, SCORE_KILLER = 1 << 27, SCORE_BAD_NOISY = -(1 << 28);
@@ -340,7 +343,7 @@ int Worker::qsearch(int alpha, int beta, int ply) {
         standPat = rawEval;
         if (hit && (tt.bound & (ttScore > standPat ? BOUND_LOWER : BOUND_UPPER))) standPat = ttScore;
         if (standPat >= beta) {
-            if (!hit) ttStore(board.hash, NO_MOVE, scoreToTable(standPat, ply), rawEval, 0, BOUND_LOWER);
+            if (!hit) ttStore(board.hash, NO_MOVE, scoreToTable(standPat, ply), rawEval, 0, BOUND_LOWER, pvNode);
             return standPat;
         }
         alpha = std::max(alpha, standPat);
@@ -382,7 +385,8 @@ int Worker::qsearch(int alpha, int beta, int ply) {
         }
     }
     if (inCheck && legal == 0) return -MATE + ply;
-    ttStore(board.hash, bestMove, scoreToTable(best, ply), rawEval, 0, best >= beta ? BOUND_LOWER : BOUND_UPPER);
+    ttStore(board.hash, bestMove, scoreToTable(best, ply), rawEval, 0, best >= beta ? BOUND_LOWER : BOUND_UPPER,
+            pvNode || (hit && tt.pv));
     return best;
 }
 
@@ -414,6 +418,9 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
     Move ttMove = ttHit ? tt.move : NO_MOVE;
     if (root && pvLength[0] == 0 && result.best && !ttMove) ttMove = result.best;
     bool ttCapture = ttMove && board.isCapture(ttMove);
+    // Positions that have been on a principal variation are likely to matter again.
+    const bool ttPv = excluded ? s->ttPv : pvNode || (ttHit && tt.pv);
+    s->ttPv = ttPv;
 
     if (!pvNode && ttHit && tt.depth >= depth && (tt.bound & (ttScore >= beta ? BOUND_LOWER : BOUND_UPPER))) {
         if (ttMove && ttScore >= beta && !ttCapture && !promoOf(ttMove))
@@ -429,7 +436,7 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
             int value = wdl == 4 ? TB_WIN - ply : wdl == 0 ? -TB_WIN + ply : wdl - 2;
             int bound = wdl == 4 ? BOUND_LOWER : wdl == 0 ? BOUND_UPPER : BOUND_EXACT;
             if (bound == BOUND_EXACT || (bound == BOUND_LOWER ? value >= beta : value <= alpha)) {
-                ttStore(board.hash, NO_MOVE, scoreToTable(value, ply), EVAL_NONE, depth + 6, bound);
+                ttStore(board.hash, NO_MOVE, scoreToTable(value, ply), EVAL_NONE, depth + 6, bound, ttPv);
                 return value;
             }
         }
@@ -445,7 +452,7 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
         int raw = ttHit && tt.eval != EVAL_NONE ? tt.eval : nnue::evaluate(board);
         s->staticEval = eval = raw;
         if (ttHit && (tt.bound & (ttScore > eval ? BOUND_LOWER : BOUND_UPPER))) eval = ttScore;
-        if (!ttHit) ttStore(board.hash, NO_MOVE, 0, raw, 0, BOUND_NONE);
+        if (!ttHit) ttStore(board.hash, NO_MOVE, 0, raw, 0, BOUND_NONE, ttPv);
     }
     // Is our position better than two plies ago? If so, pruning can be bolder.
     bool improving = false;
@@ -495,7 +502,7 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
                 board.unmake();
                 if (stopped()) return 0;
                 if (v >= probBeta) {
-                    ttStore(board.hash, m, scoreToTable(v, ply), s->staticEval, depth - 3, BOUND_LOWER);
+                    ttStore(board.hash, m, scoreToTable(v, ply), s->staticEval, depth - 3, BOUND_LOWER, ttPv);
                     return v;
                 }
             }
@@ -574,6 +581,7 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
             int r = lmrTable[std::min(depth, 63)][std::min(moveCount, 63)];
             r += !improving;
             r -= pvNode;
+            r -= ttPv && !pvNode;                          // was on a principal variation: look closer
             r += cutNode;
             if (m == s->killers[0] || m == s->killers[1] || m == counter) r--;
             if (givesCheck) r--;
@@ -628,7 +636,7 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
 
     if (!excluded)
         ttStore(board.hash, bestMove, scoreToTable(best, ply), s->staticEval, depth,
-                best >= beta ? BOUND_LOWER : best > startAlpha ? BOUND_EXACT : BOUND_UPPER);
+                best >= beta ? BOUND_LOWER : best > startAlpha ? BOUND_EXACT : BOUND_UPPER, ttPv);
     return best;
 }
 
