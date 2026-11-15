@@ -47,9 +47,18 @@ for 6 more passes at a lower learning rate, which beat v3 by about 19 Elo in the
 
 ## Search
 
-Iterative deepening with aspiration windows, principal variation search, transposition table,
-null-move pruning, reverse futility pruning, late move reductions, killer and history move
-ordering, MVV-LVA captures, quiescence search and check extensions.
+Iterative deepening with aspiration windows and principal variation search, run on several
+threads that share a lock-free transposition table (Lazy SMP). The table also remembers which
+positions have been on a principal variation, and those are reduced less.
+
+- Pruning: razoring, reverse futility pruning, null-move pruning, ProbCut, futility and late move
+  pruning, history pruning and SEE pruning of quiet moves and captures.
+- Extensions and reductions: check extensions, singular extensions (with double extensions and
+  multi-cut), late move reductions guided by history, and internal iterative reductions.
+- Move ordering: hash move, SEE-split captures with capture history, killers, countermoves, and
+  quiet history with continuation history from one and two plies back. Cutoffs that win by a
+  wide margin update the history more.
+- Quiescence search of captures, with delta pruning and SEE.
 
 Ruby picks opening moves from `Opening_Book.json` and looks up endgames of 7 pieces or fewer in
 the Lichess Syzygy tablebase API (`tablebase.lichess.ovh`) when it has enough time.
