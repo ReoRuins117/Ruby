@@ -140,18 +140,78 @@ static int scoreFromTable(int score, int ply) {
 }
 
 // ---------------------------------------------------------------- tuning numbers
+// The search's margins and reductions. Each one is also a UCI spin option of the same name, so a
+// tuner (SPSA) can adjust them between games; "tunables" prints them in a tuner-friendly list.
+//   name, default, min, max, step (the size of change SPSA starts with)
+#define RUBY_TUNABLES(X)                                                                     \
+    X(QsFutility,    150,    0,   400,  20)  /* qsearch: skip captures this far below alpha */ \
+    X(RazorBase,     200,    0,   600,  30)  /* razoring margin: base + mul * depth */         \
+    X(RazorMul,      250,   50,   600,  30)                                                    \
+    X(RfpDepth,        8,    3,    14,   1)  /* reverse futility: deepest depth used */       \
+    X(RfpMargin,      80,   30,   200,   8)  /* reverse futility: margin per ply */           \
+    X(NmpBase,         4,    2,     6,   1)  /* null move: R = base + depth / div + ... */    \
+    X(NmpDepthDiv,     3,    2,     6,   1)                                                    \
+    X(NmpEvalDiv,    200,   80,   400,  20)  /* null move: one more ply per this above beta */ \
+    X(ProbcutMargin, 200,   80,   400,  20)                                                    \
+    X(LmpBase,         3,    1,     8,   1)  /* late move pruning after (base + depth^2) */    \
+    X(FutBase,       100,    0,   300,  15)  /* futility margin: base + mul * lmrDepth */      \
+    X(FutMul,        120,   40,   250,  12)                                                    \
+    X(HistPrune,    3000, 1000,  8000, 300)  /* history pruning below -this * depth */         \
+    X(SeeQuiet,       25,    5,    60,   4)  /* SEE pruning, quiets: -this * lmrDepth^2 */    \
+    X(SeeNoisy,       90,   30,   200,   9)  /* SEE pruning, captures: -this * depth */       \
+    X(SingularMul,    20,    5,    50,   3)  /* singular beta: ttScore - this * depth / 10 */ \
+    X(DoubleExt,      25,    5,    80,   4)  /* double extension margin */                    \
+    X(LmrBase,        80,    0,   200,   8)  /* reduction: base/100 + ln d ln m / (div/100) */ \
+    X(LmrDiv,        230,  150,   400,  12)                                                    \
+    X(LmrHistDiv,   8000, 3000, 16000, 500)  /* one ply less reduction per this much history */ \
+    X(BonusMul,      170,   60,   300,  12)  /* history bonus: min(mul * depth - sub, max) */ \
+    X(BonusSub,      100,    0,   300,  15)                                                    \
+    X(BonusMax,     1600,  800,  3000, 100)                                                    \
+    X(BonusMargin,    80,   20,   200,  10)  /* cutoffs this far above beta count a ply more */ \
+    X(AspWindow,      20,    8,    60,   3)  /* first aspiration window half-width */
+
+namespace tune {
+#define RUBY_DEFINE(name, value, lo, hi, step) static int name = value;
+RUBY_TUNABLES(RUBY_DEFINE)
+#undef RUBY_DEFINE
+}
+
 static int lmrTable[64][64];
+
+static void initLmr() {
+    for (int d = 1; d < 64; d++)
+        for (int m = 1; m < 64; m++)
+            lmrTable[d][m] = int(tune::LmrBase / 100.0 + std::log(d) * std::log(m) / (tune::LmrDiv / 100.0));
+}
 
 namespace {
 struct LmrSetup {
-    LmrSetup() {
-        for (int d = 1; d < 64; d++)
-            for (int m = 1; m < 64; m++) lmrTable[d][m] = int(0.8 + std::log(d) * std::log(m) / 2.3);
-    }
+    LmrSetup() { initLmr(); }
 } lmrSetup;
 }
 
-static int statBonus(int depth) { return std::min(170 * depth - 100, 1600); }
+static const Tunable tunableList[] = {
+#define RUBY_ENTRY(name, value, lo, hi, step) {#name, &tune::name, value, lo, hi, step},
+    RUBY_TUNABLES(RUBY_ENTRY)
+#undef RUBY_ENTRY
+};
+
+const Tunable* tunables(int& count) {
+    count = int(sizeof(tunableList) / sizeof(tunableList[0]));
+    return tunableList;
+}
+
+bool setTunable(const std::string& name, int value) {
+    for (const Tunable& t : tunableList)
+        if (name == t.name) {
+            *t.value = std::clamp(value, t.min, t.max);
+            if (t.value == &tune::LmrBase || t.value == &tune::LmrDiv) initLmr();
+            return true;
+        }
+    return false;
+}
+
+static int statBonus(int depth) { return std::min(tune::BonusMul * depth - tune::BonusSub, tune::BonusMax); }
 
 // Move statistics drift towards the bonus and saturate around +-16384.
 static void gravity(int16_t& entry, int bonus) {
@@ -361,7 +421,7 @@ int Worker::qsearch(int alpha, int beta, int ply) {
         if (!inCheck) {
             if (promoOf(m) && promoOf(m) != QUEEN) continue;
             if (!promoOf(m)) {
-                int futility = standPat + SEE_VALUE[capturedType(m)] + 150;
+                int futility = standPat + SEE_VALUE[capturedType(m)] + tune::QsFutility;
                 if (futility <= alpha) { best = std::max(best, futility); continue; }   // can't get back to alpha
             }
             if (!board.see(m, 0)) continue;                // loses material
@@ -464,16 +524,16 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
 
     if (!pvNode && !inCheck && !excluded) {
         // Razoring: hopelessly below alpha, so only captures could help.
-        if (depth <= 3 && eval + 200 + 250 * depth <= alpha) {
+        if (depth <= 3 && eval + tune::RazorBase + tune::RazorMul * depth <= alpha) {
             int v = qsearch(alpha, alpha + 1, ply);
             if (v <= alpha) return v;
         }
         // Reverse futility: so far above beta at low depth that the opponent can't catch up.
-        if (depth <= 8 && eval < TB_BOUND && eval - 80 * (depth - improving) >= beta) return eval;
+        if (depth <= tune::RfpDepth && eval < TB_BOUND && eval - tune::RfpMargin * (depth - improving) >= beta) return eval;
         // Null move: if passing still beats beta, a real move almost certainly would too.
         if (depth >= 3 && eval >= beta && s->staticEval >= beta && ss(ply - 1)->move != NO_MOVE
             && beta > -TB_BOUND && board.hasNonPawnMaterial(board.side)) {
-            int R = 4 + depth / 3 + std::min((eval - beta) / 200, 3);
+            int R = tune::NmpBase + depth / tune::NmpDepthDiv + std::min((eval - beta) / tune::NmpEvalDiv, 3);
             setMove(ply, NO_MOVE, 0);
             board.makeNull();
             int v = -negamax(depth - R, -beta, -beta + 1, ply + 1, !cutNode);
@@ -483,7 +543,7 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
         }
         // ProbCut: a capture that beats beta by a wide margin in a shallow search is very likely
         // to beat beta in a full one.
-        int probBeta = beta + 200;
+        int probBeta = beta + tune::ProbcutMargin;
         if (depth >= 5 && std::abs(beta) < TB_BOUND && !(ttHit && tt.depth >= depth - 3 && ttScore < probBeta)) {
             MoveList caps;
             board.generate(caps, true);
@@ -537,11 +597,11 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
         if (!root && best > -TB_BOUND && board.hasNonPawnMaterial(board.side)) {
             int lmrDepth = std::max(depth - 1 - lmrTable[std::min(depth, 63)][std::min(moveCount + 1, 63)], 0);
             if (quiet) {
-                if (depth <= 8 && moveCount >= (3 + depth * depth) / (2 - improving)) { skipQuiets = true; continue; }
-                if (!inCheck && lmrDepth <= 8 && s->staticEval + 100 + 120 * lmrDepth <= alpha) continue;
-                if (lmrDepth <= 4 && hist < -3000 * depth) continue;
-                if (!board.see(m, -25 * lmrDepth * lmrDepth)) continue;
-            } else if (depth <= 8 && !board.see(m, -90 * depth)) {
+                if (depth <= 8 && moveCount >= (tune::LmpBase + depth * depth) / (2 - improving)) { skipQuiets = true; continue; }
+                if (!inCheck && lmrDepth <= 8 && s->staticEval + tune::FutBase + tune::FutMul * lmrDepth <= alpha) continue;
+                if (lmrDepth <= 4 && hist < -tune::HistPrune * depth) continue;
+                if (!board.see(m, -tune::SeeQuiet * lmrDepth * lmrDepth)) continue;
+            } else if (depth <= 8 && !board.see(m, -tune::SeeNoisy * depth)) {
                 continue;
             }
         }
@@ -551,14 +611,14 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
         int extension = 0;
         if (!root && m == ttMove && !excluded && depth >= 8 && (tt.bound & BOUND_LOWER) && tt.depth >= depth - 3
             && std::abs(ttScore) < TB_BOUND && ply < 2 * rootDepth) {
-            int sBeta = ttScore - 2 * depth;
+            int sBeta = ttScore - tune::SingularMul * depth / 10;
             s->excluded = m;
             int v = negamax((depth - 1) / 2, sBeta - 1, sBeta, ply, cutNode);
             s->excluded = NO_MOVE;
             if (stopped()) return 0;
             if (v < sBeta) {
                 extension = 1;
-                if (!pvNode && v < sBeta - 25 && ss(ply - 1)->doubleExtensions < 8) extension = 2;
+                if (!pvNode && v < sBeta - tune::DoubleExt && ss(ply - 1)->doubleExtensions < 8) extension = 2;
             } else if (sBeta >= beta) {
                 return sBeta;                              // several moves beat beta: cut now
             } else if (ttScore >= beta) {
@@ -586,7 +646,7 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
             if (m == s->killers[0] || m == s->killers[1] || m == counter) r--;
             if (givesCheck) r--;
             if (ttCapture && quiet) r++;
-            if (quiet) r -= hist / 8000;
+            if (quiet) r -= hist / tune::LmrHistDiv;
             int d = std::clamp(newDepth - r, 1, std::max(newDepth, 1));
             score = -negamax(d, -alpha - 1, -alpha, ply + 1, true);
             if (score > alpha && d < newDepth) score = -negamax(newDepth, -alpha - 1, -alpha, ply + 1, !cutNode);
@@ -616,7 +676,7 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
 
     // Learn from the cutoff: reward the move that caused it, penalise the ones tried before it.
     if (best >= beta) {
-        int bonus = statBonus(depth + (best > beta + 80));    // a convincing cutoff teaches more
+        int bonus = statBonus(depth + (best > beta + tune::BonusMargin));    // a convincing cutoff teaches more
         if (!board.isCapture(bestMove) && !promoOf(bestMove)) {
             if (s->killers[0] != bestMove) {
                 s->killers[1] = s->killers[0];
@@ -653,7 +713,7 @@ void Worker::iterate(bool verbose) {
     for (int depth = 1; depth <= limit.depth; depth++) {
         rootDepth = depth;
         selDepth = 0;
-        int window = 20, alpha = -MATE, beta = MATE, score = 0;
+        int window = tune::AspWindow, alpha = -MATE, beta = MATE, score = 0;
         if (depth >= 4) {                                  // expect a score near the last one
             alpha = std::max(lastScore - window, -MATE);
             beta = std::min(lastScore + window, MATE);

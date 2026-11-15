@@ -3,6 +3,7 @@
 #include "board.h"
 #include <atomic>
 #include <cstdint>
+#include <string>
 
 namespace search {
 
@@ -42,5 +43,14 @@ Result think(Board& board, const Limits& limits, bool verbose);
 // For the weaker levels: scores every legal move with a shallow search, then picks one at random,
 // favouring better moves. A higher temperature (in centipawns) makes worse moves more likely.
 Move pickWeak(Board& board, int depth, int temperature);
+
+// Search numbers a tuner can adjust (see RUBY_TUNABLES in search.cpp). Each is a UCI spin option.
+struct Tunable {
+    const char* name;
+    int* value;
+    int defaultValue, min, max, step;
+};
+const Tunable* tunables(int& count);
+bool setTunable(const std::string& name, int value);   // false if there is no such tunable
 
 }  // namespace search

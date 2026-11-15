@@ -8,6 +8,7 @@
 //   booktest             show what the opening book plays from the start position
 //   tbtest               ask the Lichess tablebase about a sample endgame
 //   bench                search some positions and report speed
+//   tunables             list the tunable search numbers (name, int, value, min, max, step, rate) for SPSA
 //   eval, d              show the current position's eval or FEN
 #include "board.h"
 #include "book.h"
@@ -186,6 +187,23 @@ static void setOption(std::istringstream& in) {
         for (int i = 0; i < NUM_LEVELS; i++)
             if (value == LEVELS[i].name) level = i;
     }
+    else search::setTunable(name, std::atoi(value.c_str()));
+}
+
+// The search's tunable numbers, as UCI options or as a tuner's list (name, int, value, min, max,
+// step, learning rate), the format OpenBench and fishtest use for SPSA.
+static void printTunables(bool asOptions) {
+    int count = 0;
+    const search::Tunable* t = search::tunables(count);
+    for (int i = 0; i < count; i++) {
+        if (asOptions)
+            std::cout << "option name " << t[i].name << " type spin default " << t[i].defaultValue
+                      << " min " << t[i].min << " max " << t[i].max << "\n";
+        else
+            std::cout << t[i].name << ", int, " << *t[i].value << ", " << t[i].min << ", " << t[i].max
+                      << ", " << t[i].step << ", 0.002\n";
+    }
+    std::cout << std::flush;
 }
 
 // ---------------------------------------------------------------- test commands
@@ -384,8 +402,9 @@ int main() {
                       << "option name EvalFile type string default " << evalFile << "\n"
                       << "option name BookFile type string default " << bookFile << "\n"
                       << "option name Level type combo default uncle_sam"
-                      << " var blunderbuss var furious_chicken var squidinator var uncle_sam\n"
-                      << "uciok" << std::endl;
+                      << " var blunderbuss var furious_chicken var squidinator var uncle_sam\n";
+            printTunables(true);
+            std::cout << "uciok" << std::endl;
         } else if (cmd == "isready") {
             waitForSearch();
             if (!nnue::loaded()) loadNetwork();
@@ -415,6 +434,7 @@ int main() {
             search::stopRequested = true;
             search::pondering = false;
             break;
+        } else if (cmd == "tunables") { printTunables(false);
         } else if (cmd == "perfttest") { perftTest();
         } else if (cmd == "evaltest") {
             std::string path = folder + "tests\\eval_vectors.txt";
