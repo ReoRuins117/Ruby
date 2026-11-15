@@ -3,19 +3,6 @@
 A chess engine with a small NNUE evaluation network trained in Python (PyTorch) and a search
 written in C++. It speaks UCI, so it works in chess GUIs and with lichess-bot.
 
-## Strength
-
-Measured at 60+1 against Stockfish 18 with its strength limiter on (Stockfish's own scale, not a
-human rating):
-
-| Opponent | Result | Score |
-|---|---|---|
-| Stockfish 2500 | +88 =9 -3 | 92.5% |
-| Stockfish 2900 | +29 =52 -19 | 55.0% |
-| Stockfish, full strength (1 thread) | +0 =2 -48 | 2.0% |
-
-That puts Ruby at about 2935 on Stockfish's limited-strength scale.
-
 ## Files
 
 | Path | What it is |
