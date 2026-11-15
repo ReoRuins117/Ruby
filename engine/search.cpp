@@ -616,7 +616,7 @@ int Worker::negamax(int depth, int alpha, int beta, int ply, bool cutNode) {
 
     // Learn from the cutoff: reward the move that caused it, penalise the ones tried before it.
     if (best >= beta) {
-        int bonus = statBonus(depth);
+        int bonus = statBonus(depth + (best > beta + 80));    // a convincing cutoff teaches more
         if (!board.isCapture(bestMove) && !promoOf(bestMove)) {
             if (s->killers[0] != bestMove) {
                 s->killers[1] = s->killers[0];
